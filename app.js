@@ -43,6 +43,7 @@ const notificationsRoutes = require("./routes/notificationsRoutes");
 const emailRoutes = require("./routes/emailRoutes");
 const Invitationsroutes = require("./routes/Invitationsroutes");
 const youtubeRoutes = require("./routes/youtubeRoutes");
+const youtubeDataRoutes = require("./routes/youtubeData.routes");
 const campaignInvitationRoutes = require("./routes/campaignInvitationRoutes");
 const delieverableRoutes = require("./routes/delieverableRoute");
 const listRoutes = require("./routes/listRoutes");
@@ -87,9 +88,9 @@ const defaultCorsOrigins = [
   "http://localhost:3000",
   "http://localhost:3001",
   "http://localhost:4000",
-  "http://192.168.1.36:3000",
+  "http://192.168.1.4:3000",
 
-  "http://192.168.1.8:3000",
+  "http://192.168.1.47:3000",
   "https://mhd.sharemitra.com",
 ];
 
@@ -395,6 +396,7 @@ app.use("/notifications", notificationsRoutes);
 app.use("/emails", emailRoutes);
 app.use("/newinvitations", Invitationsroutes);
 app.use("/youtube", youtubeRoutes);
+app.use("/youtube-data", youtubeDataRoutes);
 app.use("/campaign-invitation", campaignInvitationRoutes);
 app.use("/deliverable", delieverableRoutes);
 app.use("/list", listRoutes);
