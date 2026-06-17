@@ -773,24 +773,24 @@ exports.getListByCampaign = async (req, res) => {
 
       const isActive =
         !isRejectedContract &&
-        isCompleted === 0 &&
-        (
-          lifecycleStatusRaw === 'INFLUENCER_ACCEPTED' ||
-          lifecycleStatusRaw === 'READY_TO_SIGN' ||
-          lifecycleStatusRaw === 'MILESTONES_CREATED'
-        )
+          isCompleted === 0 &&
+          (
+            lifecycleStatusRaw === 'INFLUENCER_ACCEPTED' ||
+            lifecycleStatusRaw === 'READY_TO_SIGN' ||
+            lifecycleStatusRaw === 'MILESTONES_CREATED'
+          )
           ? 1
           : 0;
 
       const isInvited =
         !isRejectedContract &&
-        isCompleted === 0 &&
-        isActive === 0 &&
-        (
-          lifecycleStatus === 'invited' ||
-          lifecycleStatus === 'invite_sent' ||
-          lifecycleStatus === 'pending'
-        )
+          isCompleted === 0 &&
+          isActive === 0 &&
+          (
+            lifecycleStatus === 'invited' ||
+            lifecycleStatus === 'invite_sent' ||
+            lifecycleStatus === 'pending'
+          )
           ? 1
           : 0;
 
@@ -1214,7 +1214,7 @@ exports.getListByCampaign = async (req, res) => {
       const isUndicided = Number(applicant?.isUndicided) === 1 ? 1 : 0;
       const isRejected =
         Number(applicant?.isRejected) === 1 ||
-        lifecycle.lifecycleStatusRaw === 'REJECTED'
+          lifecycle.lifecycleStatusRaw === 'REJECTED'
           ? 1
           : 0;
 
@@ -1651,6 +1651,56 @@ exports.getBrandCampaignsWithAppliedInfluencers = async (req, res) => {
       return handle.startsWith("@") ? handle : `@${handle}`;
     };
 
+    const normalizeImageUrl = (value) => {
+      if (value == null) return "";
+
+      if (typeof value === "string") {
+        return value.trim();
+      }
+
+      if (Array.isArray(value)) {
+        return value.map(normalizeImageUrl).find(Boolean) || "";
+      }
+
+      if (typeof value === "object") {
+        return (
+          getFirstText(value, [
+            "dataUrl",
+            "dataURL",
+            "url",
+            "image",
+            "imageUrl",
+            "imageURL",
+            "image_url",
+            "fileUrl",
+            "fileURL",
+            "file_url",
+            "secureUrl",
+            "secureURL",
+            "secure_url",
+            "src",
+            "path",
+            "location",
+            "Location",
+          ]) || ""
+        );
+      }
+
+      return "";
+    };
+
+    const getCampaignProductImages = (campaign) => {
+      const rawImages = Array.isArray(campaign?.productImages)
+        ? campaign.productImages
+        : [];
+
+      const images = rawImages
+        .map(normalizeImageUrl)
+        .filter(Boolean);
+
+      return [...new Set(images)];
+    };
+
     const getFollowersFromProfile = (profile) => {
       return getFirstNumber(profile, [
         "followers",
@@ -1805,7 +1855,7 @@ exports.getBrandCampaignsWithAppliedInfluencers = async (req, res) => {
       $or: campaignBrandFilters,
     })
       .select(
-        "_id campaignsId campaignId brandId brandName productOrServiceName campaignTitle title name createdAt"
+        "_id campaignsId campaignId brandId brandName productOrServiceName campaignTitle title name createdAt productImages"
       )
       .sort({ createdAt: -1 })
       .lean();
@@ -1865,10 +1915,10 @@ exports.getBrandCampaignsWithAppliedInfluencers = async (req, res) => {
 
     const influencers = influencerIds.length
       ? await InfluencerModel.find({
-          _id: {
-            $in: influencerIds.map((id) => new mongoose.Types.ObjectId(id)),
-          },
-        }).lean()
+        _id: {
+          $in: influencerIds.map((id) => new mongoose.Types.ObjectId(id)),
+        },
+      }).lean()
       : [];
 
     const influencerById = new Map(
@@ -1877,8 +1927,8 @@ exports.getBrandCampaignsWithAppliedInfluencers = async (req, res) => {
 
     const modashProfiles = influencerIds.length
       ? await Modash.find({
-          influencerId: { $in: influencerIds },
-        }).lean()
+        influencerId: { $in: influencerIds },
+      }).lean()
       : [];
 
     const modashByInfluencerId = new Map();
@@ -1951,6 +2001,8 @@ exports.getBrandCampaignsWithAppliedInfluencers = async (req, res) => {
         })
         .filter(Boolean);
 
+      const productImages = getCampaignProductImages(campaign);
+
       return {
         campaignId: String(campaign._id),
         campaignsId: campaign.campaignsId || null,
@@ -1961,6 +2013,8 @@ exports.getBrandCampaignsWithAppliedInfluencers = async (req, res) => {
           campaign.name ||
           "",
         productOrServiceName: campaign.productOrServiceName || "",
+        productImage: productImages[0] || "",
+        productImages,
         appliedInfluencerCount: appliedInfluencers.length,
         appliedInfluencers,
       };
