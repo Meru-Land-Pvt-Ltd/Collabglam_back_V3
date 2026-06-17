@@ -17,7 +17,12 @@ router.get('/campaign/:campaignId/creators', (req, res, next) => {
   return browseCreators(req, res, next);
 });
 
+// Separate brand-facing media-kit API.
+router.get('/media-kit/:channelId', getCreatorMediaKit);
+
+// Backward-compatible route used by older frontend code.
 router.get('/creators/:channelId/media-kit', getCreatorMediaKit);
+
 router.get('/image-proxy', proxyImage);
 
 module.exports = router;

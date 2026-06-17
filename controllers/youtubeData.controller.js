@@ -1667,75 +1667,302 @@ async function browseCreators(req, res) {
   }
 }
 
+
+function uniqueCleanValues(values = []) {
+  return Array.from(new Set((values || []).map((x) => cleanStr(x)).filter(Boolean)));
+}
+
+function maskEmailForBrand(email) {
+  const value = cleanStr(email);
+  if (!value || value.indexOf('@') === -1) return '';
+  const parts = value.split('@');
+  const domain = parts[1] || '';
+  if (!domain) return '';
+  // Brand-facing masking: never expose full mailbox name.
+  return `xxxxxxxx@${domain}`;
+}
+
+function countVideosSince(videos = [], days = 30) {
+  const now = new Date();
+  return (videos || []).filter((video) => {
+    if (!video?.publishedAt) return false;
+    return daysBetween(video.publishedAt, now) <= days;
+  }).length;
+}
+
+function medianNumber(values = []) {
+  const nums = values.map((x) => Number(x || 0)).filter((x) => Number.isFinite(x) && x > 0).sort((a, b) => a - b);
+  if (!nums.length) return 0;
+  const mid = Math.floor(nums.length / 2);
+  return nums.length % 2 ? nums[mid] : Math.round((nums[mid - 1] + nums[mid]) / 2);
+}
+
+function scoreValue(value, fallback = 0) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+function percentValue(value, fallback = 0) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.round(n * 100) / 100;
+}
+
+function getCampaignFitLabel(score) {
+  const value = Number(score || 0);
+  if (value >= 85) return 'Excellent Match';
+  if (value >= 70) return 'Strong Match';
+  if (value >= 55) return 'Good Match';
+  return 'Moderate Match';
+}
+
+function getBudgetFitLabel(avgViews) {
+  const views = Number(avgViews || 0);
+  if (views >= 1000000) return 'High';
+  if (views >= 250000) return 'Medium-High';
+  if (views >= 50000) return 'Medium';
+  return 'Low-Medium';
+}
+
+function getCollaborationReadiness(sponsorshipFrequency, sponsoredVideosDetected) {
+  const freq = Number(sponsorshipFrequency || 0);
+  const count = Number(sponsoredVideosDetected || 0);
+  if (freq >= 30 || count >= 8) return 'High';
+  if (freq >= 10 || count >= 3) return 'Medium';
+  return 'Emerging';
+}
+
+function extractContentTopics(doc, fallbackKeyword = '') {
+  const tags = doc.channelTags || [];
+  const category = cleanStr(doc.category || doc.channelCategory);
+  const keyword = cleanStr(fallbackKeyword);
+  const titleWords = (doc.recentVideos || [])
+    .slice(0, 10)
+    .flatMap((video) => cleanStr(video.title).split(/[^A-Za-z0-9]+/))
+    .map((x) => x.trim())
+    .filter((x) => x.length > 3 && !/review|best|with|this|that|your|from|into|video|shorts/i.test(x));
+
+  return uniqueCleanValues([category, keyword, ...tags.slice(0, 8), ...titleWords.slice(0, 8)]).slice(0, 12);
+}
+
+function getShortsLongFormBreakdown(videos = []) {
+  const total = Math.max(1, videos.length);
+  const shorts = videos.filter((video) => /#shorts|\bshorts\b/i.test(`${video.title || ''} ${video.description || ''}`)).length;
+  const shortsPercentage = Math.round((shorts / total) * 100);
+  return {
+    shortsPercentage,
+    longFormPercentage: Math.max(0, 100 - shortsPercentage),
+    note: 'Estimated from recent video metadata. Exact duration-based split requires duration collection.',
+  };
+}
+
+function buildBrandMediaKitData(creator, context = {}) {
+  const discovery = buildInfluencerDiscoveryData(creator, context);
+  const videos = creator.recentVideos || [];
+  const topVideos = [...videos].sort((a, b) => Number(b.views || 0) - Number(a.views || 0)).slice(0, 5);
+  const recentVideos = [...videos].slice(0, 8);
+  const medianViews = medianNumber(videos.map((v) => v.views));
+  const avgViews = Number(creator.avgViews || 0);
+  const avgLikes = Number(creator.avgLikes || 0);
+  const avgComments = Number(creator.avgComments || 0);
+  const subscribers = Number(creator.subscribers || 0);
+  const engagementRate = percentValue(creator.engagementRate || 0);
+  const viewToSubscriberRatio = subscribers > 0 ? percentValue((avgViews / subscribers) * 100) : 0;
+  const uploadsLast30Days = countVideosSince(videos, 30);
+  const uploadsLast90Days = countVideosSince(videos, 90) || Number(creator.uploadFrequency90Days || 0);
+  const uploadsLast2Years = countVideosWithinLookback(videos);
+  const sponsoredRegex = /sponsored|partnered|collaboration|#ad|#sponsored|use code|promo code|thanks to/i;
+  const sponsoredVideosDetected = videos.filter((v) => sponsoredRegex.test(`${v.title || ''}\n${v.description || ''}`)).length;
+  const sponsorshipFrequency = videos.length ? Math.round((sponsoredVideosDetected / videos.length) * 100) : 0;
+  const scores = creator.scores || {};
+  const relevancyScore = scoreValue(scores.relevancyScore || discovery.scores?.relevancyScore || discovery.shortlist?.score);
+  const brandSafetyScore = scoreValue(scores.brandSafetyScore || discovery.scores?.brandSafetyScore || 95);
+  const authenticityScore = scoreValue(scores.authenticityScore || discovery.scores?.authenticityScore || 85);
+  const engagementScore = scoreValue(scores.engagementScore || discovery.scores?.engagementScore);
+  const consistencyScore = scoreValue(scores.consistencyScore || discovery.scores?.consistencyScore);
+  const sponsorshipScore = scoreValue(scores.sponsorshipScore || discovery.scores?.sponsorshipScore);
+  const campaignFitScore = scoreValue(scores.shortlistScore || discovery.shortlist?.score || relevancyScore);
+  const countryConfidence = scoreValue(scores.audienceCountryConfidence || discovery.audienceCountryConfidence);
+  const primaryCountry = cleanStr(creator.country || creator.estimatedAudienceCountry || discovery.country || discovery.estimatedAudienceCountry || 'Unknown');
+  const estimatedCountry = cleanStr(creator.estimatedAudienceCountry || creator.country || primaryCountry);
+  const topics = extractContentTopics(creator, context.keyword || context.category || creator.category || creator.channelCategory);
+  const contentBreakdown = getShortsLongFormBreakdown(videos);
+  const emails = uniqueCleanValues([...(creator.contact?.emails || []), ...(creator.contact?.totalEmails || []), creator.contact?.youtubeAboutEmail]);
+  const socialLinks = uniqueCleanValues([
+    creator.contact?.instagram,
+    creator.contact?.twitter,
+    creator.contact?.facebook,
+    creator.contact?.linkedin,
+    ...(creator.contact?.socials || []),
+    ...(creator.contact?.otherSocials || []),
+  ]);
+  const websites = uniqueCleanValues([creator.contact?.website, ...(creator.contact?.websites || [])]);
+  const recentSponsors = uniqueCleanValues([...(creator.contact?.sponsors || []), ...(String(discovery.shortlist?.previousSponsors || '').split(',').map((x) => x.trim()).filter((x) => x && x !== 'N/A'))]).slice(0, 8);
+  const expectedViewsLow = Math.round((medianViews || avgViews) * 0.75);
+  const expectedViewsHigh = Math.round((medianViews || avgViews) * 1.25);
+  const expectedEngagementLow = Math.round(expectedViewsLow * (engagementRate / 100));
+  const expectedEngagementHigh = Math.round(expectedViewsHigh * (engagementRate / 100));
+  const safeRiskFlags = [];
+  if (brandSafetyScore < 70) safeRiskFlags.push('Review content manually before approval');
+  if (engagementRate < 0.5) safeRiskFlags.push('Low engagement rate');
+  if (!creator.country) safeRiskFlags.push('Channel country not publicly set');
+
+  const contact = {
+    hasContactInfo: Boolean(emails.length || websites.length || socialLinks.length),
+    maskedEmail: emails[0] ? maskEmailForBrand(emails[0]) : '',
+    website: websites[0] || '',
+    socialLinks: socialLinks.map((url) => {
+      let platform = 'Website';
+      if (/instagram\.com/i.test(url)) platform = 'Instagram';
+      else if (/twitter\.com|x\.com/i.test(url)) platform = 'X / Twitter';
+      else if (/facebook\.com/i.test(url)) platform = 'Facebook';
+      else if (/tiktok\.com/i.test(url)) platform = 'TikTok';
+      else if (/linkedin\.com/i.test(url)) platform = 'LinkedIn';
+      return { platform, url };
+    }).slice(0, 8),
+  };
+
+  return {
+    creatorOverview: {
+      creatorName: creator.channelName,
+      channelName: creator.channelName,
+      profilePhoto: creator.thumbnail,
+      category: creator.category || creator.channelCategory || 'YouTube Creator',
+      creatorTier: getTierFromSubscribers(creator.subscribers),
+      primaryLanguage: creator.primaryLanguage || 'Unknown',
+      secondaryLanguages: [],
+      country: creator.country || '',
+      estimatedAudienceCountry: estimatedCountry,
+      countryConfidence,
+      yearsOnYouTube: creator.yearsOnYouTube || 0,
+      channelCreatedDate: creator.createdDate || creator.channelCreatedDate || null,
+      activeSinceLabel: creator.createdDate || creator.channelCreatedDate ? `Active since ${new Date(creator.createdDate || creator.channelCreatedDate).getFullYear()}` : '',
+    },
+    coreMetrics: {
+      subscribers,
+      totalViews: creator.totalViews || 0,
+      totalVideos: creator.totalVideos || 0,
+      avgViews,
+      medianViews,
+      avgLikes,
+      avgComments,
+      engagementRate,
+      viewToSubscriberRatio,
+      recentUploadDate: creator.recentUploadDate || null,
+      uploadsLast30Days,
+      uploadsLast90Days,
+      uploadsLast2Years,
+    },
+    performanceScores: {
+      engagementScore,
+      consistencyScore,
+      authenticityScore,
+      brandSafetyScore,
+      sponsorshipScore,
+      relevancyScore,
+      campaignFitScore,
+      nicheFitScore: scoreValue((discovery.shortlist?.nicheFit || scores.nicheFit || 0) * 10),
+    },
+    audienceInsights: {
+      estimatedAudienceCountries: [
+        { country: estimatedCountry || primaryCountry || 'Unknown', percentage: countryConfidence || 0 },
+        ...(primaryCountry && primaryCountry !== estimatedCountry ? [{ country: primaryCountry, percentage: Math.max(0, 100 - (countryConfidence || 0)) }] : []),
+      ].filter((x) => x.country && x.country !== 'Unknown' || x.percentage > 0),
+      interestCategories: topics,
+      contentLanguage: creator.primaryLanguage || 'Unknown',
+    },
+    brandFit: {
+      matchedCampaignKeyword: context.keyword || context.category || creator.category || creator.channelCategory || '',
+      matchedTopics: topics.slice(0, 8),
+      campaignFit: getCampaignFitLabel(campaignFitScore),
+      whyThisCreatorFits: [
+        `${relevancyScore}% relevancy score for this niche`,
+        `${engagementRate}% engagement rate from recent videos`,
+        `${uploadsLast90Days} uploads in the last 90 days`,
+        brandSafetyScore >= 85 ? 'Strong brand safety signal' : 'Needs manual brand-safety review',
+        sponsorshipFrequency > 0 ? `${sponsorshipFrequency}% sponsorship frequency detected` : 'Limited sponsorship history detected',
+      ].filter(Boolean),
+    },
+    contentAnalysis: {
+      contentType: discovery.shortlist?.contentQuality || creator.contentFlag || 'Mixed',
+      uploadFrequency: discovery.shortlist?.uploadFrequency || 'Unknown',
+      shortsPercentage: contentBreakdown.shortsPercentage,
+      longFormPercentage: contentBreakdown.longFormPercentage,
+      averageVideoLengthMinutes: null,
+      recentVideoThemes: topics.slice(0, 10),
+      contentBreakdownNote: contentBreakdown.note,
+    },
+    sponsorshipAnalysis: {
+      sponsoredVideosDetected,
+      sponsorshipFrequency,
+      recentSponsors,
+      promoCodeMentions: videos.filter((v) => /promo code|use code|discount code/i.test(`${v.title || ''}\n${v.description || ''}`)).length,
+      affiliateLinksDetected: Boolean((creator.contact?.otherLinks || []).length || (creator.contact?.websites || []).some((x) => /amzn\.to|bit\.ly|linktr|affiliate/i.test(x))),
+      collaborationReadiness: getCollaborationReadiness(sponsorshipFrequency, sponsoredVideosDetected),
+    },
+    brandSafety: {
+      score: brandSafetyScore,
+      riskLevel: brandSafetyScore >= 85 ? 'Low' : brandSafetyScore >= 70 ? 'Medium' : 'High',
+      flags: safeRiskFlags,
+      safeCategories: uniqueCleanValues([creator.category, creator.channelCategory, ...topics]).slice(0, 6),
+    },
+    topPerformingVideos: topVideos.map((video) => ({
+      title: video.title || '',
+      views: video.views || 0,
+      likes: video.likes || 0,
+      comments: video.comments || 0,
+      publishedAt: video.publishedAt || null,
+      thumbnail: video.thumbnail || '',
+    })),
+    recentVideos: recentVideos.map((video) => ({
+      title: video.title || '',
+      views: video.views || 0,
+      likes: video.likes || 0,
+      comments: video.comments || 0,
+      publishedAt: video.publishedAt || null,
+      thumbnail: video.thumbnail || '',
+    })),
+    campaignPrediction: {
+      expectedViewsLow,
+      expectedViewsHigh,
+      expectedEngagementLow,
+      expectedEngagementHigh,
+      recommendedDeliverables: [
+        'Dedicated Review',
+        'Integrated Mention',
+        contentBreakdown.shortsPercentage > 25 ? 'Shorts Placement' : 'Community Post',
+      ],
+      budgetFit: getBudgetFitLabel(avgViews),
+    },
+    contact,
+    collabGlamRecommendation: {
+      recommendation: getCampaignFitLabel(campaignFitScore),
+      summary: `${creator.channelName} is a ${getTierFromSubscribers(creator.subscribers)} YouTube creator with ${avgViews.toLocaleString()} average views and a ${campaignFitScore}/100 campaign fit score for this search.`,
+    },
+  };
+}
+
 async function getCreatorMediaKit(req, res) {
   try {
     const channelId = cleanStr(req.params.channelId);
     const creator = await YouTubeData.findOne({ channelId }).lean();
     if (!creator) return res.status(404).json({ success: false, error: 'YouTube creator not found' });
 
-    const expectedViewsLow = Math.round((creator.avgViews || 0) * 0.8);
-    const expectedViewsHigh = Math.round((creator.avgViews || 0) * 1.2);
-    const expectedEngagementLow = Math.round(((creator.avgLikes || 0) + (creator.avgComments || 0)) * 0.8);
-    const expectedEngagementHigh = Math.round(((creator.avgLikes || 0) + (creator.avgComments || 0)) * 1.2);
-    const discovery = buildInfluencerDiscoveryData(creator, {});
+    const context = {
+      keyword: cleanStr(req.query.keyword || req.query.search),
+      category: cleanStr(req.query.category || req.query.niche),
+      country: cleanStr(req.query.country),
+    };
+
+    const mediaKit = buildBrandMediaKitData(creator, context);
 
     return res.status(200).json({
       success: true,
-      data: {
-        influencerDiscovery: discovery,
-        overview: {
-          profilePhoto: creator.thumbnail,
-          creatorName: creator.channelName,
-          channelName: creator.channelName,
-          channelUrl: creator.channelUrl,
-          category: creator.category || creator.channelCategory,
-          primaryLanguage: creator.primaryLanguage,
-          country: creator.country,
-          estimatedAudienceCountry: creator.estimatedAudienceCountry,
-          audienceCountryConfidence: creator.scores?.audienceCountryConfidence || 0,
-          yearsOnYouTube: creator.yearsOnYouTube,
-          subscribers: creator.subscribers,
-        },
-        keyMetrics: {
-          totalViews: creator.totalViews,
-          totalVideos: creator.totalVideos,
-          avgViews: creator.avgViews,
-          avgLikes: creator.avgLikes,
-          avgComments: creator.avgComments,
-          engagementRate: creator.engagementRate,
-          uploadFrequency30Days: creator.uploadFrequency30Days,
-          uploadFrequency90Days: creator.uploadFrequency90Days,
-        },
-        audienceInsights: {
-          geography: [{
-            country: creator.estimatedAudienceCountry || creator.country || 'Unknown',
-            confidence: creator.scores?.audienceCountryConfidence || 0,
-            note: 'Estimated from channel country, language, keywords, and location clues.',
-          }],
-          language: creator.primaryLanguage || 'Unknown',
-          interests: [creator.category, creator.channelCategory, ...(creator.channelTags || []).slice(0, 8)].filter(Boolean),
-        },
-        contentPerformance: {
-          topVideos: creator.topVideos || [],
-          recentVideos: creator.recentVideos || [],
-        },
-        collaborationHistory: {
-          sponsors: creator.contact?.sponsors || [],
-          sponsoredVideosDetected: (creator.recentVideos || []).filter((v) => /sponsored|partnered|collaboration|#ad|#sponsored|use code|promo code/i.test(`${v.title || ''}\n${v.description || ''}`)).length,
-        },
-        shortlist: discovery.shortlist,
-        scores: creator.scores || {},
-        contact: creator.contact || {},
-        campaignContexts: creator.campaignContexts || [],
-        campaignPrediction: {
-          expectedViews: { low: expectedViewsLow, high: expectedViewsHigh },
-          expectedEngagement: { low: expectedEngagementLow, high: expectedEngagementHigh },
-          campaignFit: (creator.scores?.relevancyScore || 0) >= 80 ? 'Excellent' : (creator.scores?.relevancyScore || 0) >= 60 ? 'Good' : 'Moderate',
-        },
-      },
+      data: mediaKit,
     });
   } catch (err) {
-    await saveErrorLog(req, err, err?.status || 500, 'YOUTUBE_MEDIA_KIT');
+    await saveErrorLog(req, err, err?.status || 500, 'YOUTUBE_BRAND_MEDIA_KIT');
     return res.status(err?.status || 500).json({
       success: false,
       error: err?.message || 'Failed to load media kit',
