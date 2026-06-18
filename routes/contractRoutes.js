@@ -42,6 +42,8 @@ const {
 
   getOwnContractUploadUrl,
   sendUploadedOwnContract,
+  getInfluencerOwnContractUploadUrl,
+  sendInfluencerUploadedOwnContract,
 } = require("../controllers/contractController");
 
 router.post("/initiate", initiate);
@@ -108,5 +110,8 @@ router.post("/send-requirements", getSendContractRequirements);
 
 router.post("/own/upload-url", getOwnContractUploadUrl);
 router.post("/own/send-uploaded", sendUploadedOwnContract);
+
+router.post("/own/influencer/upload-url", getInfluencerOwnContractUploadUrl);
+router.post("/own/influencer/send-signed", sendInfluencerUploadedOwnContract);
 
 module.exports = router;
