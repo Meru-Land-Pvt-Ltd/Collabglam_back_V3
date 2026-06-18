@@ -1,11 +1,11 @@
 // models/MissingEmail.js
-const mongoose = require('mongoose');
-const { v4: uuidv4 } = require('uuid');
+const mongoose = require("mongoose");
+const { v4: uuidv4 } = require("uuid");
 
 const EMAIL_RX = /^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/;
 const HANDLE_RX = /^@[A-Za-z0-9._\-]+$/;
 
-const PLATFORM_ENUM = ['youtube'];
+const PLATFORM_ENUM = ["youtube"];
 
 const YouTubeSchema = new mongoose.Schema(
   {
@@ -22,6 +22,55 @@ const YouTubeSchema = new mongoose.Schema(
     topicCategories: [{ type: String }],
     topicCategoryLabels: [{ type: String }],
     fetchedAt: { type: Date },
+  },
+  { _id: false }
+);
+
+const EmailTemplateSnapshotSchema = new mongoose.Schema(
+  {
+    from: { type: String, default: null, lowercase: true, trim: true },
+    subject: { type: String, default: "", trim: true },
+    text: { type: String, default: "" },
+    html: { type: String, default: "" },
+    cc: [{ type: String, lowercase: true, trim: true }],
+    bcc: [{ type: String, lowercase: true, trim: true }],
+    replyTo: [{ type: String, lowercase: true, trim: true }],
+    attachmentNames: [{ type: String, trim: true }],
+  },
+  { _id: false }
+);
+
+const MissingEmailCampaignSchema = new mongoose.Schema(
+  {
+    brandId: {
+      type: String,
+      default: null,
+      index: true,
+      ref: "Brand",
+    },
+
+    campaignId: {
+      type: String,
+      default: null,
+      index: true,
+      ref: "Campaign",
+    },
+
+    campaignName: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+
+    emailTemplate: {
+      type: EmailTemplateSnapshotSchema,
+      default: undefined,
+    },
+
+    requestedAt: {
+      type: Date,
+      default: Date.now,
+    },
   },
   { _id: false }
 );
@@ -44,17 +93,17 @@ const MissingEmailSchema = new mongoose.Schema(
       default: null,
       validate: {
         validator: (v) => !v || EMAIL_RX.test(v),
-        message: 'Invalid email address',
+        message: "Invalid email address",
       },
     },
 
     handle: {
       type: String,
-      required: [true, 'Handle is required'],
+      required: [true, "Handle is required"],
       lowercase: true,
       trim: true,
       validate: {
-        validator: (v) => HANDLE_RX.test(v || ''),
+        validator: (v) => HANDLE_RX.test(v || ""),
         message:
           'Handle must start with "@" and contain letters, numbers, ".", "_" or "-"',
       },
@@ -67,15 +116,15 @@ const MissingEmailSchema = new mongoose.Schema(
       trim: true,
       enum: {
         values: PLATFORM_ENUM,
-        message: 'Platform must be youtube',
+        message: "Platform must be youtube",
       },
-      default: 'youtube',
+      default: "youtube",
     },
 
     status: {
       type: String,
-      enum: ['pending', 'resolved'],
-      default: 'pending',
+      enum: ["pending", "resolved"],
+      default: "pending",
       index: true,
     },
 
@@ -84,11 +133,16 @@ const MissingEmailSchema = new mongoose.Schema(
       default: undefined,
     },
 
+    campaigns: {
+      type: [MissingEmailCampaignSchema],
+      default: [],
+    },
+
     createdByAdminId: {
       type: String,
       index: true,
       default: null,
-      ref: 'Admin',
+      ref: "Admin",
     },
   },
   { timestamps: true }
@@ -97,7 +151,10 @@ const MissingEmailSchema = new mongoose.Schema(
 MissingEmailSchema.index({ handle: 1 }, { unique: true });
 MissingEmailSchema.index({ email: 1 }, { sparse: true });
 MissingEmailSchema.index({ createdAt: -1 });
+MissingEmailSchema.index({ "youtube.channelId": 1 }, { sparse: true });
+MissingEmailSchema.index({ handle: 1, "campaigns.campaignId": 1 });
+MissingEmailSchema.index({ "campaigns.brandId": 1, "campaigns.campaignId": 1 });
 
 module.exports =
   mongoose.models.MissingEmail ||
-  mongoose.model('MissingEmail', MissingEmailSchema);
+  mongoose.model("MissingEmail", MissingEmailSchema);
