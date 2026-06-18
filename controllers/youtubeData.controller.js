@@ -19,6 +19,108 @@ function tryRequireModel(paths) {
   return null;
 }
 
+
+function allowExternalMongoSort(query) {
+  if (!query) return query;
+
+  if (typeof query.allowDiskUse === 'function') {
+    return query.allowDiskUse(true);
+  }
+
+  if (typeof query.setOptions === 'function') {
+    return query.setOptions({ allowDiskUse: true });
+  }
+
+  return query;
+}
+
+function sortPlainDocsInMemory(items = [], sort = {}) {
+  const entries = Object.entries(sort || {});
+  if (!entries.length) return items;
+
+  const getValue = (obj, path) => String(path || '').split('.').reduce((acc, key) => {
+    if (acc == null) return undefined;
+    return acc[key];
+  }, obj);
+
+  return [...items].sort((a, b) => {
+    for (const [field, dir] of entries) {
+      const direction = Number(dir) >= 0 ? 1 : -1;
+      const av = getValue(a, field);
+      const bv = getValue(b, field);
+      const an = Number(av);
+      const bn = Number(bv);
+
+      let cmp = 0;
+      if (Number.isFinite(an) || Number.isFinite(bn)) {
+        cmp = (Number.isFinite(an) ? an : -Infinity) - (Number.isFinite(bn) ? bn : -Infinity);
+      } else {
+        cmp = String(av || '').localeCompare(String(bv || ''));
+      }
+
+      if (cmp !== 0) return cmp * direction;
+    }
+    return 0;
+  });
+}
+
+async function findSortedWithDiskUse(Model, filter, sort, options = {}) {
+  const cleanFilter = filter || {};
+  const cleanSort = sort || {};
+  const skip = Number(options.skip || 0);
+  const limit = Number(options.limit || 0);
+  const hasSkip = Number.isFinite(skip) && skip > 0;
+  const hasLimit = Number.isFinite(limit) && limit > 0;
+
+  const pipeline = [{ $match: cleanFilter }];
+
+  if (cleanSort && Object.keys(cleanSort).length) {
+    pipeline.push({ $sort: cleanSort });
+  }
+
+  if (hasSkip) pipeline.push({ $skip: skip });
+  if (hasLimit) pipeline.push({ $limit: limit });
+
+  try {
+    // Use the native MongoDB driver first because it reliably passes allowDiskUse
+    // to the server. Some Mongoose versions ignore allowDiskUse on sorted reads.
+    if (Model.collection && typeof Model.collection.aggregate === 'function') {
+      return await Model.collection.aggregate(pipeline, {
+        allowDiskUse: true,
+        maxTimeMS: 600000,
+      }).toArray();
+    }
+
+    if (typeof Model.aggregate === 'function') {
+      const agg = Model.aggregate(pipeline);
+      if (typeof agg.allowDiskUse === 'function') agg.allowDiskUse(true);
+      if (typeof agg.option === 'function') agg.option({ allowDiskUse: true, maxTimeMS: 600000 });
+      return await agg.exec();
+    }
+  } catch (err) {
+    const message = String(err && err.message ? err.message : err || '');
+    const isSortMemoryError = /Sort exceeded memory limit|allowDiskUse/i.test(message);
+    if (!isSortMemoryError) throw err;
+
+    // Last-resort fallback: do not fail the API if Mongo still refuses disk sort.
+    // Load a bounded matching pool without DB sort, then sort it in Node memory.
+    const fallbackLimit = Math.min(5000, Math.max(hasLimit ? limit * 8 : 1000, 1000));
+    let fallbackQuery = Model.find(cleanFilter).limit(fallbackLimit);
+    if (typeof fallbackQuery.maxTimeMS === 'function') fallbackQuery = fallbackQuery.maxTimeMS(600000);
+    const fallbackDocs = await fallbackQuery.lean();
+    const sortedDocs = sortPlainDocsInMemory(fallbackDocs, cleanSort);
+    return hasLimit ? sortedDocs.slice(skip, skip + limit) : sortedDocs.slice(skip);
+  }
+
+  let query = Model.find(cleanFilter);
+  if (cleanSort && Object.keys(cleanSort).length) query = query.sort(cleanSort);
+  if (hasSkip) query = query.skip(skip);
+  if (hasLimit) query = query.limit(limit);
+  if (typeof query.maxTimeMS === 'function') query = query.maxTimeMS(600000);
+
+  return allowExternalMongoSort(query).lean();
+}
+
 const Campaign =
   tryRequireModel([
     '../models/campaign.model',
@@ -1029,6 +1131,29 @@ async function lookupLabelsByIds(Model, ids = []) {
   }
 }
 
+async function lookupDocsByIds(Model, ids = []) {
+  if (!Model) return [];
+
+  const cleanIds = Array.from(new Set((ids || []).map(cleanStr).filter(Boolean)));
+  if (!cleanIds.length) return [];
+
+  try {
+    return await Model.find({ _id: { $in: cleanIds } }).lean();
+  } catch (_) {
+    return [];
+  }
+}
+
+function extractTagsFromDocs(rows = []) {
+  return uniqueCleanValues((rows || []).flatMap((row) => [
+    ...normalizeLooseArray(row?.tags),
+    ...normalizeLooseArray(row?.keywords),
+    ...normalizeLooseArray(row?.searchKeywords),
+    ...normalizeLooseArray(row?.aliases),
+    cleanStr(row?.slug),
+  ]));
+}
+
 function normalizeLooseArray(value) {
   if (Array.isArray(value)) return value.map(cleanStr).filter(Boolean);
   if (typeof value === 'string') {
@@ -1038,6 +1163,101 @@ function normalizeLooseArray(value) {
       .filter(Boolean);
   }
   return [];
+}
+
+
+function getObjectLabels(items = [], keys = []) {
+  if (!Array.isArray(items)) return [];
+  const out = [];
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    for (const key of keys) {
+      const value = item?.[key];
+      if (Array.isArray(value)) out.push(...value.map(cleanStr).filter(Boolean));
+      else if (value && typeof value === 'object') out.push(getDocLabel(value));
+      else out.push(cleanStr(value));
+    }
+  }
+  return out.filter(Boolean);
+}
+
+function getCampaignDetailSubcategories(campaign = {}) {
+  const direct = Array.isArray(campaign.details?.subcategories) ? campaign.details.subcategories : [];
+  const legacy = Array.isArray(campaign.subcategories) ? campaign.subcategories : [];
+  return [...direct, ...legacy];
+}
+
+function getCampaignDetailTags(campaign = {}) {
+  return uniqueCleanValues([
+    ...getObjectLabels(getCampaignDetailSubcategories(campaign), ['tags']),
+    ...normalizeLooseArray(campaign.tags),
+    ...normalizeLooseArray(campaign.preferredHashtags),
+    ...normalizeLooseArray(campaign.hashtags),
+  ]);
+}
+
+function getCampaignDetailCountryLabels(campaign = {}) {
+  const countries = Array.isArray(campaign.details?.targetCountries)
+    ? campaign.details.targetCountries
+    : [];
+
+  return uniqueCleanValues([
+    ...getObjectLabels(countries, ['countryCode', 'countryName', 'name', 'code']),
+    ...normalizeLooseArray(campaign.targetCountries),
+    ...normalizeLooseArray(campaign.countries),
+    cleanStr(campaign.targetCountry),
+    cleanStr(campaign.country),
+  ]);
+}
+
+function getCampaignDetailTierLabels(campaign = {}) {
+  const tiers = Array.isArray(campaign.details?.influencerTiers)
+    ? campaign.details.influencerTiers
+    : [];
+
+  return uniqueCleanValues([
+    ...getObjectLabels(tiers, ['category', 'value', 'label', 'name']),
+    ...normalizeLooseArray(campaign.influencerTiers),
+    cleanStr(campaign.influencerTier),
+  ]);
+}
+
+// Fallback tier mapping for the static master-data ids used by CollabGlam.
+// This protects recommendations when the tier lookup model is unavailable in production.
+const KNOWN_INFLUENCER_TIER_ID_MAP = {
+  '69aa85fa66939e6156941f5a': 'Nano',
+  '69aa85fa66939e6156941f5b': 'Micro',
+  '69aa85fa66939e6156941f5c': 'Mid-tier',
+  '69aa85fa66939e6156941f5d': 'Macro',
+  '69aa85fa66939e6156941f5e': 'Mega',
+};
+
+function getTierLabelsFromKnownIds(campaign = {}) {
+  return uniqueCleanValues((campaign.influencerTierIds || [])
+    .map((id) => KNOWN_INFLUENCER_TIER_ID_MAP[cleanStr(id).toLowerCase()])
+    .filter(Boolean));
+}
+
+function getCampaignDetailFormatLabels(campaign = {}) {
+  const formats = Array.isArray(campaign.details?.contentFormats)
+    ? campaign.details.contentFormats
+    : [];
+
+  return uniqueCleanValues([
+    ...getObjectLabels(formats, ['format', 'name', 'label']),
+    ...normalizeLooseArray(campaign.contentFormatNames),
+  ]);
+}
+
+function getCampaignDetailGoalLabels(campaign = {}) {
+  const goals = Array.isArray(campaign.details?.campaignGoals)
+    ? campaign.details.campaignGoals
+    : [];
+
+  return uniqueCleanValues([
+    ...getObjectLabels(goals, ['goal', 'name', 'label']),
+    ...normalizeLooseArray(campaign.campaignGoalNames),
+  ]);
 }
 
 function isGenericCampaignPhrase(value = '') {
@@ -1071,6 +1291,14 @@ function isLowValueCampaignTerm(value = '') {
     'explain', 'feel', 'lifestyle-led', 'makes', 'message', 'naturally',
     'prioritize', 'show', 'storytelling', 'authentic', 'valuable', 'value',
     'desirable', 'memorable', 'everyday', 'appeal', 'strong', 'clear',
+    'our', 'solution', 'solutions', 'advanced', 'business', 'businesses',
+    'capability', 'capabilities', 'control', 'controls', 'demonstrating',
+    'future', 'technology', 'professional', 'professionals', 'innovation',
+    'innovative', 'enable', 'enables', 'image', 'quality', 'intelligent',
+    'reliability', 'reliable', 'versatility', 'versatile', 'various',
+    'setting', 'settings', 'filming', 'surveying', 'exploration', 'website',
+    'learn', 'more', 'purchase', 'purchasing', 'options', 'visit', 'objective',
+    'main', 'includes', 'seeking', 'unique', 'perspectives', 'exceptional',
   ]);
 
   return lowValue.has(v);
@@ -1169,20 +1397,25 @@ function normalizeCountryLabel(value = '') {
 }
 
 async function enrichCampaignReferenceLabels(campaign = {}) {
-  const [countryLabels, categoryLabels, subcategoryLabels, tierLabels, goalLabels, formatLabels] =
+  const subcategoryIds = campaign.subcategoryIds || [];
+  const [countryLabels, categoryLabels, subcategoryDocs, tierLabels, goalLabels, formatLabels] =
     await Promise.all([
       lookupLabelsByIds(CountryModel, campaign.targetCountryIds || campaign.countryIds || []),
       lookupLabelsByIds(CategoryModel, [campaign.categoryId].filter(Boolean)),
-      lookupLabelsByIds(SubcategoryModel, campaign.subcategoryIds || []),
+      lookupDocsByIds(SubcategoryModel, subcategoryIds),
       lookupLabelsByIds(InfluencerTierModel, campaign.influencerTierIds || []),
       lookupLabelsByIds(CampaignGoalModel, campaign.campaignGoals || []),
       lookupLabelsByIds(ContentFormatModel, campaign.contentFormats || []),
     ]);
 
+  const subcategoryLabels = subcategoryDocs.map(getDocLabel).filter(Boolean);
+  const subcategoryTags = extractTagsFromDocs(subcategoryDocs);
+
   return {
     countryLabels,
     categoryLabels,
     subcategoryLabels,
+    subcategoryTags,
     tierLabels,
     goalLabels,
     formatLabels,
@@ -1197,41 +1430,48 @@ function normalizeCampaignDetailsForRecommendation(campaign = {}, refs = {}, ove
   const additionalNotes = cleanStr(campaign.additionalNotes || campaign.notes || campaign.creatorNotes);
   const campaignBudget = toNum(campaign.campaignBudget ?? campaign.budget ?? campaign.totalBudget ?? overrides.campaignBudget);
   const paymentType = cleanStr(campaign.paymentType || overrides.paymentType);
+  const detailSubcategories = getCampaignDetailSubcategories(campaign);
+  const detailTags = uniqueCleanValues([
+    ...getCampaignDetailTags(campaign),
+    ...(refs.subcategoryTags || []),
+  ]);
 
   const categoryLabels = uniqueCleanValues([
     ...(refs.categoryLabels || []),
     ...(refs.subcategoryLabels || []),
     ...normalizeLooseArray(campaign.categoryNames),
     ...normalizeLooseArray(campaign.subcategoryNames),
+    ...getObjectLabels(campaign.categories || [], ['categoryName', 'subcategoryName', 'name']),
+    cleanStr(campaign.details?.category?.name),
+    ...getObjectLabels(detailSubcategories, ['name', 'categoryName', 'subcategoryName']),
+    cleanStr(campaign.campaignCategory),
+    cleanStr(campaign.campaignSubcategory),
     cleanStr(campaign.categoryName),
     cleanStr(campaign.subcategoryName),
   ]);
 
   const countryLabels = uniqueCleanValues([
     ...(refs.countryLabels || []),
-    ...normalizeLooseArray(campaign.targetCountries),
-    ...normalizeLooseArray(campaign.countries),
-    cleanStr(campaign.targetCountry),
-    cleanStr(campaign.country),
+    ...getCampaignDetailCountryLabels(campaign),
     cleanStr(overrides.country),
   ]);
 
   const tierLabels = uniqueCleanValues([
     ...(refs.tierLabels || []),
-    ...normalizeLooseArray(campaign.influencerTiers),
-    cleanStr(campaign.influencerTier),
+    ...getCampaignDetailTierLabels(campaign),
+    ...getTierLabelsFromKnownIds(campaign),
     cleanStr(overrides.subscriberTier),
   ]);
 
   const contentFormats = uniqueCleanValues([
     ...(refs.formatLabels || []),
-    ...normalizeLooseArray(campaign.contentFormatNames),
+    ...getCampaignDetailFormatLabels(campaign),
     ...normalizeLooseArray(overrides.contentFormats),
   ]);
 
   const campaignGoals = uniqueCleanValues([
     ...(refs.goalLabels || []),
-    ...normalizeLooseArray(campaign.campaignGoalNames),
+    ...getCampaignDetailGoalLabels(campaign),
     ...normalizeLooseArray(overrides.campaignGoals),
   ]);
 
@@ -1241,21 +1481,36 @@ function normalizeCampaignDetailsForRecommendation(campaign = {}, refs = {}, ove
   const subscriberTier = cleanStr(overrides.subscriberTier) || detectSubscriberTierFromLabels(tierLabels) || detectSubscriberTierFromBudget(campaignBudget);
 
   const titleIsGeneric = isGenericCampaignPhrase(campaignTitle);
-  const inferredNiche = importantTerms.slice(0, 2).join(' ');
+  const highIntentTags = detailTags
+    .filter((term) => !isLowValueCampaignTerm(term))
+    .slice(0, 18);
+  const inferredNiche =
+    highIntentTags[0] ||
+    categoryLabels.find((label) => /drone|camera|beauty|food|home|tech|fitness|fashion|travel|clean/i.test(label)) ||
+    importantTerms.slice(0, 2).join(' ');
 
   const campaignNiche =
     cleanStr(overrides.category || overrides.niche) ||
     base.campaignNiche ||
-    categoryLabels[0] ||
+    categoryLabels.find((label) => !/^camera\s*&\s*photography$/i.test(label)) ||
     inferredNiche ||
+    categoryLabels[0] ||
     'product review';
 
   const productName =
     cleanStr(overrides.keyword || overrides.productName) ||
     base.productName ||
+    highIntentTags[0] ||
     (!titleIsGeneric ? campaignTitle : '') ||
     campaignNiche ||
     'product review';
+
+  const tagSearchTerms = highIntentTags.flatMap((tag) => [
+    tag,
+    `${tag} review`,
+    `${tag} tutorial`,
+    `${tag} creator`,
+  ]);
 
   const rawKeywords = uniqueCleanValues([
     ...base.keywords.filter((term) => !isLowValueCampaignTerm(term)),
@@ -1263,10 +1518,11 @@ function normalizeCampaignDetailsForRecommendation(campaign = {}, refs = {}, ove
     productName,
     campaignNiche,
     ...categoryLabels,
+    ...tagSearchTerms,
     ...importantTerms,
     ...contentFormats,
     ...campaignGoals,
-  ]).filter((term) => !isLowValueCampaignTerm(term)).slice(0, 30);
+  ]).filter((term) => !isLowValueCampaignTerm(term)).slice(0, 60);
 
   const tierRange = getSubscriberTierRange(subscriberTier);
 
@@ -1297,6 +1553,7 @@ function normalizeCampaignDetailsForRecommendation(campaign = {}, refs = {}, ove
     categoryLabels,
     countryLabels,
     tierLabels,
+    campaignTags: highIntentTags,
     keywords: rawKeywords,
   };
 }
@@ -1722,6 +1979,12 @@ function passesCampaignRules(doc, campaignDetails = {}) {
   // Min avg views can still be used as a hard quality gate when provided.
   if (minAvgViews != null && doc.avgViews < minAvgViews) return false;
 
+  // Campaign relevance gate: do not save generic creators into campaign recommendation DB
+  // unless their channel/video text actually matches the campaign topic.
+  const topicMatch = getCreatorCampaignTopicMatch(doc, campaignDetails);
+  if (!topicMatch.matched) return false;
+  doc.campaignTopicMatchedTerms = topicMatch.matchedTerms;
+
   // Country is a hard filter when selected. Use actual YouTube channel country only.
   // Do not use estimatedAudienceCountry here; the user asked that US should show only US channels.
   if (strictCountry && targetCountry) {
@@ -1846,8 +2109,52 @@ const SORT_MAP = {
   brand_safety_desc: { 'scores.brandSafetyScore': -1 },
 };
 
+function getCampaignTextMatchTerms({ keyword, category, keywords = [] } = {}) {
+  return uniqueCleanValues([
+    keyword,
+    category,
+    ...(Array.isArray(keywords) ? keywords : []),
+  ])
+    .filter((term) => !isLowValueCampaignTerm(term))
+    .filter((term) => cleanStr(term).length >= 2)
+    .slice(0, 50);
+}
+
+function buildCreatorTextMatchOr(terms = []) {
+  const fields = [
+    'channelName',
+    'description',
+    'category',
+    'channelCategory',
+    'channelTags',
+    'topicLabels',
+    'searchKeywords',
+    'allSearchKeywordsUsed',
+    'matchedKeyword',
+    'foundViaQuery',
+    'sourceVideoTitle',
+    'recentVideoTitles',
+    'recentVideos.title',
+    'recentVideos.description',
+    'campaignContexts.campaignNiche',
+    'campaignContexts.foundViaQuery',
+    'campaignContexts.sourceVideoTitle',
+    'campaignContexts.allSearchKeywordsUsed',
+    'campaignContexts.matchedKeyword',
+    'contentAnalysis.themes',
+  ];
+
+  const out = [];
+  for (const term of getCampaignTextMatchTerms({ keywords: terms })) {
+    const rx = new RegExp(escapeRegex(term), 'i');
+    for (const field of fields) out.push({ [field]: rx });
+  }
+  return out;
+}
+
 function buildMongoFilter({
   keyword,
+  keywords,
   country,
   minSubscribers,
   maxSubscribers,
@@ -1869,37 +2176,9 @@ function buildMongoFilter({
     and.push({ $or: [{ lastCampaignId: campaignId }, { 'campaignContexts.campaignId': campaignId }] });
   }
 
-  if (keyword) {
-    const rx = new RegExp(escapeRegex(keyword), 'i');
-    and.push({
-      $or: [
-        { channelName: rx },
-        { description: rx },
-        { category: rx },
-        { channelCategory: rx },
-        { channelTags: rx },
-        { 'recentVideos.title': rx },
-        { 'recentVideos.description': rx },
-      ],
-    });
-  }
-
-  if (category) {
-    const rx = new RegExp(escapeRegex(category), 'i');
-    and.push({
-      $or: [
-        { category: rx },
-        { channelCategory: rx },
-        { channelTags: rx },
-        { description: rx },
-        { channelName: rx },
-        { 'recentVideos.title': rx },
-        { 'recentVideos.description': rx },
-        { 'campaignContexts.campaignNiche': rx },
-        { 'campaignContexts.foundViaQuery': rx },
-        { 'campaignContexts.sourceVideoTitle': rx },
-      ],
-    });
+  const textTerms = getCampaignTextMatchTerms({ keyword, category, keywords });
+  if (textTerms.length) {
+    and.push({ $or: buildCreatorTextMatchOr(textTerms) });
   }
 
   if (country) {
@@ -2005,6 +2284,100 @@ function sortDiscoveryDataForSelectedFilters(items = [], context = {}) {
   });
 }
 
+
+const browseCreatorRefreshJobs = new Map();
+const BROWSE_REFRESH_STALE_MS = 8 * 60 * 1000;
+const BROWSE_REFRESH_KEEP_MS = 30 * 60 * 1000;
+
+function buildBrowseRefreshJobKey(campaignDetails = {}) {
+  return JSON.stringify({
+    campaignId: cleanStr(campaignDetails.campaignId),
+    keyword: cleanStr(campaignDetails.productName || campaignDetails.keyword).toLowerCase(),
+    niche: cleanStr(campaignDetails.campaignNiche).toLowerCase(),
+    country: cleanStr(campaignDetails.targetCountry).toUpperCase(),
+    minSubscribers: campaignDetails.minSubscribers ?? null,
+    maxSubscribers: campaignDetails.maxSubscribers ?? null,
+    minAvgViews: campaignDetails.minAvgViews ?? null,
+    strictCountry: Boolean(campaignDetails.strictCountry),
+    strictFilters: Boolean(campaignDetails.strictFilters),
+  });
+}
+
+function publicBrowseJobStatus(job) {
+  if (!job) return null;
+  return {
+    status: job.status,
+    startedAt: job.startedAt ? new Date(job.startedAt).toISOString() : null,
+    finishedAt: job.finishedAt ? new Date(job.finishedAt).toISOString() : null,
+    refreshedCount: Number(job.refreshedCount || 0),
+    error: job.error || null,
+  };
+}
+
+function startBrowseCreatorsBackgroundRefresh(jobKey, campaignDetails, options = {}) {
+  const now = Date.now();
+  const existing = browseCreatorRefreshJobs.get(jobKey);
+  const force = Boolean(options.force);
+
+  if (
+    existing &&
+    existing.status === 'running' &&
+    !force &&
+    now - Number(existing.startedAt || 0) < BROWSE_REFRESH_STALE_MS
+  ) {
+    return {
+      started: false,
+      alreadyRunning: true,
+      status: publicBrowseJobStatus(existing),
+    };
+  }
+
+  const job = {
+    status: 'running',
+    startedAt: now,
+    finishedAt: null,
+    refreshedCount: 0,
+    error: null,
+  };
+
+  browseCreatorRefreshJobs.set(jobKey, job);
+
+  Promise.resolve()
+    .then(async () => {
+      try {
+        job.refreshedCount = await refreshChannelsForCampaign(campaignDetails);
+        job.status = 'completed';
+      } catch (err) {
+        job.status = 'failed';
+        job.error = err?.message || 'YouTube background refresh failed';
+        console.error('[YouTube browse background refresh failed]', job.error);
+      } finally {
+        job.finishedAt = Date.now();
+        const cleanupTimer = setTimeout(() => {
+          if (browseCreatorRefreshJobs.get(jobKey) === job) {
+            browseCreatorRefreshJobs.delete(jobKey);
+          }
+        }, BROWSE_REFRESH_KEEP_MS);
+
+        if (cleanupTimer && typeof cleanupTimer.unref === 'function') {
+          cleanupTimer.unref();
+        }
+      }
+    })
+    .catch((err) => {
+      job.status = 'failed';
+      job.finishedAt = Date.now();
+      job.error = err?.message || 'YouTube background refresh crashed';
+      console.error('[YouTube browse background refresh crashed]', job.error);
+    });
+
+  return {
+    started: true,
+    alreadyRunning: false,
+    status: publicBrowseJobStatus(job),
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                Controllers                                 */
 /* -------------------------------------------------------------------------- */
@@ -2040,28 +2413,56 @@ async function browseCreators(req, res) {
 
     let liveError = null;
     let refreshedCount = 0;
+    let backgroundStarted = false;
+    let backgroundAlreadyRunning = false;
+    let backgroundJobStatus = null;
+
     const shouldRefresh = Boolean(campaignId) || Boolean(cleanStr(q.keyword || q.search)) || Boolean(requestedCategory);
+    const fastMode = ['true', '1', 'yes'].includes(
+      String(q.fast || q.background || q.nonBlocking || q.async || '').toLowerCase()
+    );
+    const allowBackground = String(q.background ?? 'true').toLowerCase() !== 'false';
+    const forceBackground = ['true', '1', 'yes'].includes(String(q.forceBackground || '').toLowerCase());
+    const minimumResults = Math.min(
+      limit,
+      Math.max(1, toIntOrNull(q.minimumResults) || toIntOrNull(q.minimumInfluencers) || Math.min(50, limit))
+    );
+
+    const refreshPayload = {
+      ...campaignDetails,
+      campaignId,
+      campaignNiche: requestedCategory || campaignDetails.campaignNiche || keyword,
+      productName: campaignDetails.productName || keyword,
+      targetCountry: country,
+      minSubscribers,
+      maxSubscribers,
+      minAvgViews,
+      strictFilters,
+      strictCountry,
+      targetSaveCount: frontendPagination && country
+        ? Math.min(RAW_CHANNELS_PER_SEARCH, Math.max(limit * 3, TARGET_CHANNELS_PER_SEARCH))
+        : Math.max(TARGET_CHANNELS_PER_SEARCH, minimumResults),
+      keywords: Array.from(new Set([...(campaignDetails.keywords || []), keyword, requestedCategory].filter(Boolean))),
+    };
 
     if (shouldRefresh) {
-      try {
-        refreshedCount = await refreshChannelsForCampaign({
-          ...campaignDetails,
-          campaignNiche: requestedCategory || campaignDetails.campaignNiche || keyword,
-          productName: campaignDetails.productName || keyword,
-          targetCountry: country,
-          minSubscribers,
-          maxSubscribers,
-          minAvgViews,
-          strictFilters,
-          strictCountry,
-          targetSaveCount: frontendPagination && country
-            ? Math.min(RAW_CHANNELS_PER_SEARCH, Math.max(limit * 3, TARGET_CHANNELS_PER_SEARCH))
-            : TARGET_CHANNELS_PER_SEARCH,
-          keywords: Array.from(new Set([...(campaignDetails.keywords || []), keyword, requestedCategory].filter(Boolean))),
-        });
-      } catch (err) {
-        liveError = err?.message || 'YouTube live fetch failed. Showing cached data.';
-        await saveErrorLog(req, err, err?.status || 429, 'YOUTUBE_LIVE_FETCH');
+      if (fastMode) {
+        if (allowBackground) {
+          const jobKey = buildBrowseRefreshJobKey(refreshPayload);
+          const bg = startBrowseCreatorsBackgroundRefresh(jobKey, refreshPayload, {
+            force: forceBackground,
+          });
+          backgroundStarted = bg.started;
+          backgroundAlreadyRunning = bg.alreadyRunning;
+          backgroundJobStatus = bg.status;
+        }
+      } else {
+        try {
+          refreshedCount = await refreshChannelsForCampaign(refreshPayload);
+        } catch (err) {
+          liveError = err?.message || 'YouTube live fetch failed. Showing cached data.';
+          await saveErrorLog(req, err, err?.status || 429, 'YOUTUBE_LIVE_FETCH');
+        }
       }
     }
 
@@ -2091,11 +2492,10 @@ async function browseCreators(req, res) {
       strictFilters,
     };
 
-    const items = await YouTubeData.find(filter)
-      .sort(SORT_MAP[sort])
-      .skip(skip)
-      .limit(mongoLimit)
-      .lean();
+    const items = await findSortedWithDiskUse(YouTubeData, filter, SORT_MAP[sort], {
+      skip,
+      limit: mongoLimit,
+    });
 
     const sortedData = sortDiscoveryDataForSelectedFilters(
       items.map((doc) => creatorListDTO(doc, context)),
@@ -2108,7 +2508,13 @@ async function browseCreators(req, res) {
 
     return res.status(200).json({
       success: true,
+      mode: fastMode ? 'fast' : 'live',
+      processing: fastMode && Boolean(backgroundStarted || backgroundAlreadyRunning || data.length < minimumResults),
       refreshedCount,
+      backgroundStarted,
+      backgroundAlreadyRunning,
+      backgroundJobStatus,
+      minimumResults,
       activityLookbackDays: CREATOR_LOOKBACK_DAYS,
       activityLookbackStartDate: activeSinceDate,
       data,
@@ -2445,6 +2851,154 @@ function getRecommendationRowChannelKey(row = {}) {
   return cleanStr(row.channelId || row.doc?.channelId || row.ids?.youtubeChannelId || row._id).toLowerCase();
 }
 
+
+function normalizeMatchText(value = '') {
+  return cleanStr(value)
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function termMatchesText(term, text) {
+  const t = normalizeMatchText(term);
+  const hay = normalizeMatchText(text);
+  if (!t || !hay) return false;
+
+  if (t.includes(' ')) return hay.includes(t);
+  return new RegExp(`(^|\\s)${escapeRegex(t)}(s|es)?(?=\\s|$)`, 'i').test(hay);
+}
+
+function expandCampaignTopicTerms(campaignDetails = {}) {
+  const raw = uniqueCleanValues([
+    campaignDetails.productName,
+    campaignDetails.campaignNiche,
+    ...(campaignDetails.campaignTags || []),
+    ...(campaignDetails.categoryLabels || []),
+    ...(campaignDetails.keywords || []),
+  ]).filter((term) => !isLowValueCampaignTerm(term));
+
+  const important = [];
+  for (const term of raw) {
+    const clean = cleanStr(term);
+    if (!clean) continue;
+    important.push(clean);
+
+    // Split labels like "Drones & Action Cams" into usable topic tokens.
+    clean
+      .toLowerCase()
+      .replace(/&/g, ' ')
+      .split(/[^a-z0-9]+/)
+      .map((part) => part.trim())
+      .filter((part) => part.length >= 3 && !isLowValueCampaignTerm(part))
+      .forEach((part) => important.push(part));
+  }
+
+  const lower = important.join(' ').toLowerCase();
+
+  if (/\bdrone|drones|aerial|fpv|dji|mavic|gopro|action\s*cam/.test(lower)) {
+    important.push(
+      'drone',
+      'drones',
+      'drone camera',
+      'aerial photography',
+      'aerial videography',
+      'fpv drone',
+      'dji',
+      'mavic',
+      'mini drone',
+      'air drone',
+      'gopro',
+      'action camera'
+    );
+  }
+
+  if (/pool|cleaner|cleaning|maintenance/.test(lower)) {
+    important.push('pool cleaner', 'pool cleaning', 'pool maintenance', 'robotic pool cleaner', 'cleaning review');
+  }
+
+  // Remove very broad tags unless we have no specific terms.
+  const specific = uniqueCleanValues(important)
+    .filter((term) => !isLowValueCampaignTerm(term))
+    .filter((term) => !/^(camera|photography|action|review|reviews|creator|creators|video|short|live)$/i.test(term));
+
+  return specific.length ? specific.slice(0, 80) : uniqueCleanValues(important).slice(0, 30);
+}
+
+function getCreatorContentTextForCampaignMatch(row = {}) {
+  const contexts = Array.isArray(row.campaignContexts) ? row.campaignContexts : [];
+  return [
+    row.channelName,
+    row.channelUrl,
+    row.category,
+    row.channelCategory,
+    ...(row.channelTags || []),
+    row.description,
+    row.sourceVideoTitle,
+    row.foundViaQuery,
+    row.creatorSnapshot?.category,
+    row.creatorSnapshot?.description,
+    row.creatorSnapshot?.primaryLanguage,
+    ...(row.recentVideos || []).map((video) => `${video?.title || ''} ${video?.description || ''}`),
+    ...(row.recentVideoTitles || []).map((video) => typeof video === 'string' ? video : `${video?.title || ''}`),
+    ...(contexts || []).map((ctx) => [
+      ctx.sourceVideoTitle,
+      ctx.foundViaQuery,
+      ctx.sourceVideoUrl,
+      ...(Array.isArray(ctx.allSearchKeywordsUsed) ? ctx.allSearchKeywordsUsed : []),
+    ].join(' ')),
+  ].join(' ');
+}
+
+function isClearlyNonCreatorChannel(row = {}) {
+  const text = normalizeMatchText([
+    row.channelName,
+    row.channelUrl,
+    row.category,
+    row.channelCategory,
+    row.creatorSnapshot?.category,
+    row.creatorSnapshot?.description,
+  ].join(' '));
+
+  if (!text) return false;
+
+  return /\b(cnn|bbc news|fox news|abc news|nbc news|cbs news|msnbc|reuters|associated press|ap archive|ted ed|ted-ed|official channel|official store|company channel)\b/.test(text) ||
+    /\b(news network|news channel|breaking news|tv news|media outlet)\b/.test(text);
+}
+
+function getCreatorCampaignTopicMatch(row = {}, campaignDetails = {}) {
+  if (isClearlyNonCreatorChannel(row)) {
+    return { matched: false, matchedTerms: [], reason: 'non_creator_channel' };
+  }
+
+  const terms = expandCampaignTopicTerms(campaignDetails);
+  if (!terms.length) return { matched: true, matchedTerms: [], reason: 'no_terms' };
+
+  const text = getCreatorContentTextForCampaignMatch(row);
+  const matchedTerms = terms.filter((term) => termMatchesText(term, text));
+
+  return {
+    matched: matchedTerms.length > 0,
+    matchedTerms: uniqueCleanValues(matchedTerms).slice(0, 12),
+    reason: matchedTerms.length ? 'topic_match' : 'no_topic_match',
+  };
+}
+
+function filterRowsByCampaignTopic(rows = [], campaignDetails = {}) {
+  return (Array.isArray(rows) ? rows : [])
+    .map((row) => {
+      const match = getCreatorCampaignTopicMatch(row, campaignDetails);
+      return {
+        ...row,
+        campaignTopicMatch: match.matched,
+        campaignTopicMatchedTerms: match.matchedTerms,
+        campaignTopicMatchReason: match.reason,
+      };
+    })
+    .filter((row) => row.campaignTopicMatch);
+}
+
 function sortRecommendationRowsForTier(rows = [], { minSubscribers = null, maxSubscribers = null, campaignDetails = {}, strictTier = false, limit = 100 } = {}) {
   const minimumTarget = getMinimumRecommendedInfluencerTarget(limit);
   const hasTierRequest = hasCampaignTierRequest(campaignDetails, minSubscribers, maxSubscribers);
@@ -2625,6 +3179,7 @@ function buildCampaignInfluencerPayload(doc, discovery, campaignDetails, recomme
       foundViaQuery: doc.foundViaQuery || discovery.foundViaQuery || '',
       recommendationScore,
       recommendationReason,
+      topicMatchedTerms: doc.campaignTopicMatchedTerms || [],
       matchedAt: new Date(),
     },
   };
@@ -2863,10 +3418,12 @@ async function getSavedCampaignRecommendationRows(campaignId, brandId, limit = 1
     filter.$and = [{ $or: [{ brandIds: brandObjectId }, { 'campaignContexts.brandId': brandObjectId }] }];
   }
 
-  const rows = await CampaignInfluencer.find(filter)
-    .sort({ 'scores.recommendationScore': -1, lastRecommendedAt: -1, updatedAt: -1 })
-    .limit(Math.min(500, Math.max(1, limit)))
-    .lean();
+  const rows = await findSortedWithDiskUse(
+    CampaignInfluencer,
+    filter,
+    { 'scores.recommendationScore': -1, lastRecommendedAt: -1, updatedAt: -1 },
+    { limit: Math.min(500, Math.max(1, limit)) }
+  );
 
   return rows.map((row) => ({ ...row, saved: true }));
 }
@@ -2890,14 +3447,28 @@ async function buildCampaignRecommendationRowsFromCache({
   // Always load a wider soft-tier pool first so the API can return at least 50 creators.
   // The selected tier is still respected by ranking tier matches first, and by returning
   // only selected-tier rows when at least 50 are available.
-  const filter = buildMongoFilter({
+  const matchTerms = getCampaignTextMatchTerms({
     keyword,
-    country,
+    category,
+    keywords: [
+      ...(campaignDetails.keywords || []),
+      ...(campaignDetails.campaignTags || []),
+      ...(campaignDetails.categoryLabels || []),
+    ],
+  });
+
+  const filter = buildMongoFilter({
+    keyword: '',
+    keywords: matchTerms,
+    // Recommendation needs at least 50 creators. Country is applied as a
+    // priority after loading the niche pool so blank YouTube country values do
+    // not reduce the list to zero.
+    country: '',
     minSubscribers: strictTier ? minSubscribers : null,
     maxSubscribers: strictTier ? maxSubscribers : null,
     minAvgViews: campaignDetails.minAvgViews,
     minEngagement: null,
-    category,
+    category: '',
     campaignId: '',
     includeExcluded,
     strictFilters: strictTier,
@@ -2914,43 +3485,58 @@ async function buildCampaignRecommendationRowsFromCache({
     strictFilters: strictTier,
   };
 
-  const docs = await YouTubeData.find(filter)
-    .sort(SORT_MAP.relevance)
-    .limit(Math.min(1000, Math.max(limit * 10, TARGET_CHANNELS_PER_SEARCH, minimumTarget * 8)))
-    .lean();
+  const docs = await findSortedWithDiskUse(
+    YouTubeData,
+    filter,
+    SORT_MAP.relevance,
+    { limit: Math.min(1000, Math.max(limit * 10, TARGET_CHANNELS_PER_SEARCH, minimumTarget * 8)) }
+  );
 
   const ranked = docs
     .map((doc) => {
-      const discovery = creatorListDTO(doc, context);
-      const recommendationScore = calculateRecommendationScore(doc, discovery, campaignDetails);
+      const topicMatch = getCreatorCampaignTopicMatch(doc, campaignDetails);
+      if (!topicMatch.matched) return null;
+
+      const docWithMatch = {
+        ...doc,
+        campaignTopicMatchedTerms: topicMatch.matchedTerms,
+      };
+      const discovery = creatorListDTO(docWithMatch, context);
+      const recommendationScore = calculateRecommendationScore(docWithMatch, discovery, campaignDetails);
       return {
-        doc,
+        doc: docWithMatch,
         discovery,
         recommendationScore,
         tierMatch: isSubscriberTierMatch(doc.subscribers, minSubscribers, maxSubscribers) ? 1 : 0,
         countryMatch: isCountryMatchForFilter(doc, country) ? 1 : 0,
+        topicMatchCount: topicMatch.matchedTerms.length,
       };
     })
-    .filter((row) => !country || row.countryMatch)
+    .filter(Boolean)
     .sort((a, b) => {
       if (a.countryMatch !== b.countryMatch) return b.countryMatch - a.countryMatch;
       if (hasTierRequest && a.tierMatch !== b.tierMatch) return b.tierMatch - a.tierMatch;
+      if (a.topicMatchCount !== b.topicMatchCount) return b.topicMatchCount - a.topicMatchCount;
       if (a.recommendationScore !== b.recommendationScore) return b.recommendationScore - a.recommendationScore;
       return Number(b.doc.subscribers || 0) - Number(a.doc.subscribers || 0);
     });
 
-  let selectedRanked = ranked;
+  const countryRanked = country ? ranked.filter((row) => row.countryMatch) : ranked;
+  const countryExtraRanked = country ? ranked.filter((row) => !row.countryMatch) : [];
+  let selectedRanked = countryRanked.length >= minimumTarget
+    ? countryRanked
+    : [...countryRanked, ...countryExtraRanked].slice(0, Math.max(minimumTarget, limit));
 
   if (hasTierRequest) {
-    const tierRanked = ranked.filter((row) => row.tierMatch);
-    const extraRanked = ranked.filter((row) => !row.tierMatch);
+    const tierRanked = selectedRanked.filter((row) => row.tierMatch);
+    const extraRanked = selectedRanked.filter((row) => !row.tierMatch);
 
     if (strictTier || tierRanked.length >= minimumTarget) {
       selectedRanked = tierRanked;
     } else {
-      // Selected tier was too small. Fill only enough extra creators to reach the
-      // minimum target, not the full 100, so tier remains the priority.
-      selectedRanked = [...tierRanked, ...extraRanked].slice(0, minimumTarget);
+      // Selected tier remains first. If it has fewer than 50, fill only enough
+      // extra relevant creators to reach the minimum target.
+      selectedRanked = [...tierRanked, ...extraRanked].slice(0, Math.max(minimumTarget, limit));
     }
   }
 
@@ -3000,15 +3586,19 @@ async function runCampaignRecommendationBackgroundJob(args) {
       maxSubscribers,
       minAvgViews: campaignDetails.minAvgViews,
       strictFilters: strictTier,
-      strictCountry: Boolean(country),
-      targetSaveCount: Math.min(RAW_CHANNELS_PER_SEARCH, Math.max(limit * 5, TARGET_CHANNELS_PER_SEARCH)),
+      // Keep country in the search queries and ranking, but do not hard-block
+      // creator saves by YouTube's often-empty channel country field. This is
+      // required to reliably return the minimum 50 recommendations.
+      strictCountry: false,
+      targetSaveCount: Math.min(RAW_CHANNELS_PER_SEARCH, Math.max(limit * 5, TARGET_CHANNELS_PER_SEARCH, 250)),
       keywords: uniqueCleanValues([
         ...(campaignDetails.keywords || []),
+        ...(campaignDetails.campaignTags || []),
         keyword,
         category,
         campaignDetails.campaignTitle,
         campaignDetails.description,
-      ]).slice(0, 30),
+      ]).slice(0, 60),
     });
 
     await buildCampaignRecommendationRowsFromCache({
@@ -3139,11 +3729,12 @@ async function recommendCreatorsForCampaign(req, res) {
       subscriberTier: campaignDetails.subscriberTier || q.subscriberTier,
       keywords: uniqueCleanValues([
         ...(campaignDetails.keywords || []),
+        ...(campaignDetails.campaignTags || []),
         keyword,
         category,
         campaignDetails.campaignTitle,
         campaignDetails.description,
-      ]).slice(0, 30),
+      ]).slice(0, 60),
     };
 
     const jobKey = campaignRecommendationJobKey({
@@ -3173,7 +3764,8 @@ async function recommendCreatorsForCampaign(req, res) {
       );
 
       if (savedRows.length) {
-        rows = sortRecommendationRowsForTier(savedRows, {
+        const topicMatchedSavedRows = filterRowsByCampaignTopic(savedRows, normalizedCampaignDetails);
+        rows = sortRecommendationRowsForTier(topicMatchedSavedRows, {
           minSubscribers,
           maxSubscribers,
           campaignDetails: normalizedCampaignDetails,
@@ -3261,6 +3853,8 @@ async function recommendCreatorsForCampaign(req, res) {
         },
         ...channelNamePayload,
         ...recommendationCountStatus,
+        topicMatchedCount: rows.filter((row) => row.campaignTopicMatch !== false).length,
+        topicTerms: expandCampaignTopicTerms(normalizedCampaignDetails).slice(0, 25),
         data: dtoRows,
         rawCampaign: {
           _id: rawCampaign?._id || campaignId,
@@ -3279,8 +3873,8 @@ async function recommendCreatorsForCampaign(req, res) {
           maxSubscribers,
           minAvgViews: campaignDetails.minAvgViews,
           strictFilters: strictTier,
-          strictCountry: Boolean(country) && strictCountry,
-          targetSaveCount: Math.min(RAW_CHANNELS_PER_SEARCH, Math.max(limit * 3, TARGET_CHANNELS_PER_SEARCH)),
+          strictCountry: false,
+          targetSaveCount: Math.min(RAW_CHANNELS_PER_SEARCH, Math.max(limit * 5, TARGET_CHANNELS_PER_SEARCH, 250)),
         });
       } catch (err) {
         liveError = err?.message || 'YouTube live fetch failed. Showing cached recommendations.';
