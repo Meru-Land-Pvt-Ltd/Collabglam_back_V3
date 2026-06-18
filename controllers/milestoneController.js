@@ -5,6 +5,7 @@ const Campaign = require("../models/campaign");
 const Brand = require("../models/brand");
 const { InfluencerModel: Influencer } = require("../models/influencer");
 const Contract = require("../models/contract");
+const ContractSignature = require("../models/contractSignature");
 const { BrandWalletModel } = require("../models/brandWallet");
 
 const { createAndEmit } = require("../utils/notifier");
@@ -21,6 +22,169 @@ const APP_BASE_URL = process.env.APP_BASE_URL || "";
 
 // ---------------- wallet helpers ----------------
 
+const roundMoney = (value) => Math.round((Number(value) || 0) * 100) / 100;
+
+const syncUsableBalance = (wallet) => {
+  wallet.walletBalance = Math.max(0, roundMoney(wallet.walletBalance));
+  wallet.escrowBalance = Math.max(
+    0,
+    roundMoney(wallet.escrowBalance ?? wallet.frozenBalance ?? 0)
+  );
+
+  // frozenBalance is kept as a backward-compatible alias for escrowBalance.
+  wallet.frozenBalance = wallet.escrowBalance;
+
+  // In the single-wallet model, usable balance is the available walletBalance.
+  wallet.usableBalance = wallet.walletBalance;
+
+  return {
+    walletBalance: wallet.walletBalance,
+    escrowBalance: wallet.escrowBalance,
+    frozenBalance: wallet.frozenBalance,
+    usableBalance: wallet.usableBalance,
+  };
+};
+
+const addEscrowHistory = (wallet, payload = {}) => {
+  wallet.escrowHistories = Array.isArray(wallet.escrowHistories)
+    ? wallet.escrowHistories
+    : [];
+
+  wallet.escrowHistories.push({
+    brandId: String(payload.brandId || wallet.brandId || ""),
+    type: String(payload.type || "milestone_escrow"),
+    amount: roundMoney(payload.amount),
+    currency: String(payload.currency || "usd").toLowerCase(),
+    campaignId: String(payload.campaignId || ""),
+    influencerId: String(payload.influencerId || ""),
+    contractId: String(payload.contractId || ""),
+    milestoneId: String(payload.milestoneId || ""),
+    milestoneHistoryId: String(payload.milestoneHistoryId || ""),
+    milestoneTitle: String(payload.milestoneTitle || ""),
+    walletBalanceBefore: roundMoney(payload.walletBalanceBefore),
+    walletBalanceAfter: roundMoney(payload.walletBalanceAfter),
+    escrowBalanceBefore: roundMoney(payload.escrowBalanceBefore),
+    escrowBalanceAfter: roundMoney(payload.escrowBalanceAfter),
+    note: String(payload.note || ""),
+    createdAt: new Date(),
+  });
+
+  wallet.markModified("escrowHistories");
+};
+
+const moveAmountToEscrow = (wallet, payload = {}) => {
+  const amount = roundMoney(payload.amount);
+  const before = syncUsableBalance(wallet);
+
+  if (!amount || amount <= 0) {
+    const err = new Error("amount must be > 0");
+    err.status = 400;
+    throw err;
+  }
+
+  if (before.walletBalance < amount) {
+    const err = new Error(
+      "Insufficient brand wallet balance. Please top up the remaining amount."
+    );
+    err.status = 402;
+    err.extra = {
+      walletBalance: before.walletBalance,
+      escrowBalance: before.escrowBalance,
+      frozenBalance: before.frozenBalance,
+      usableBalance: before.usableBalance,
+      requiredAmount: amount,
+      needToAdd: roundMoney(amount - before.walletBalance),
+    };
+    throw err;
+  }
+
+  wallet.walletBalance = roundMoney(before.walletBalance - amount);
+  wallet.escrowBalance = roundMoney(before.escrowBalance + amount);
+  wallet.frozenBalance = wallet.escrowBalance;
+  wallet.usableBalance = wallet.walletBalance;
+
+  const after = syncUsableBalance(wallet);
+
+  addEscrowHistory(wallet, {
+    ...payload,
+    type: payload.type || "milestone_escrow",
+    amount,
+    walletBalanceBefore: before.walletBalance,
+    walletBalanceAfter: after.walletBalance,
+    escrowBalanceBefore: before.escrowBalance,
+    escrowBalanceAfter: after.escrowBalance,
+  });
+
+  return after;
+};
+
+const refundAmountFromEscrow = (wallet, payload = {}) => {
+  const amount = roundMoney(payload.amount);
+  const before = syncUsableBalance(wallet);
+  const refundAmount = Math.min(amount, before.escrowBalance);
+
+  if (!refundAmount || refundAmount <= 0) return before;
+
+  wallet.walletBalance = roundMoney(before.walletBalance + refundAmount);
+  wallet.escrowBalance = roundMoney(before.escrowBalance - refundAmount);
+  wallet.frozenBalance = wallet.escrowBalance;
+  wallet.usableBalance = wallet.walletBalance;
+
+  const after = syncUsableBalance(wallet);
+
+  addEscrowHistory(wallet, {
+    ...payload,
+    type: payload.type || "milestone_escrow_refund",
+    amount: refundAmount,
+    walletBalanceBefore: before.walletBalance,
+    walletBalanceAfter: after.walletBalance,
+    escrowBalanceBefore: before.escrowBalance,
+    escrowBalanceAfter: after.escrowBalance,
+  });
+
+  return after;
+};
+
+const releaseAmountFromEscrow = (wallet, payload = {}) => {
+  const amount = roundMoney(payload.amount);
+  const before = syncUsableBalance(wallet);
+
+  if (!amount || amount <= 0) {
+    const err = new Error("amount must be > 0");
+    err.status = 400;
+    throw err;
+  }
+
+  if (before.escrowBalance < amount) {
+    const err = new Error("Escrow balance is less than milestone amount.");
+    err.status = 400;
+    err.extra = {
+      escrowBalance: before.escrowBalance,
+      frozenBalance: before.frozenBalance,
+      releaseAmount: amount,
+    };
+    throw err;
+  }
+
+  wallet.escrowBalance = roundMoney(before.escrowBalance - amount);
+  wallet.frozenBalance = wallet.escrowBalance;
+  wallet.usableBalance = wallet.walletBalance;
+
+  const after = syncUsableBalance(wallet);
+
+  addEscrowHistory(wallet, {
+    ...payload,
+    type: "milestone_release",
+    amount,
+    walletBalanceBefore: before.walletBalance,
+    walletBalanceAfter: after.walletBalance,
+    escrowBalanceBefore: before.escrowBalance,
+    escrowBalanceAfter: after.escrowBalance,
+  });
+
+  return after;
+};
+
 const getOrCreateBrandWallet = async (brandId, session = null) => {
   let query = BrandWalletModel.findOne({ brandId });
   if (session) query = query.session(session);
@@ -31,9 +195,13 @@ const getOrCreateBrandWallet = async (brandId, session = null) => {
     wallet = new BrandWalletModel({
       brandId,
       walletBalance: 0,
+      escrowBalance: 0,
+      frozenBalance: 0,
       usableBalance: 0,
-      freezes: [],
       topups: [],
+      escrowHistories: [],
+      withdrawHistories: [],
+      freezes: [],
     });
   }
 
@@ -74,9 +242,10 @@ const getWalletSnapshotByBrandId = async (brandId) => {
   if (!wallet) {
     return {
       walletBalance: 0,
+      escrowBalance: 0,
       frozenBalance: 0,
       usableBalance: 0,
-      freezes: [],
+      escrowHistories: [],
     };
   }
 
@@ -85,67 +254,15 @@ const getWalletSnapshotByBrandId = async (brandId) => {
 
   return {
     walletBalance: snap.walletBalance,
+    escrowBalance: snap.escrowBalance,
     frozenBalance: snap.frozenBalance,
     usableBalance: snap.usableBalance,
-    freezes: wallet.freezes || [],
+    escrowHistories: wallet.escrowHistories || [],
   };
 };
 
-const calcAllocationTotal = (allocations = []) =>
-  allocations.reduce((sum, item) => sum + (Number(item.amount) || 0), 0);
-
-const calcReleasedTotal = (allocations = []) =>
-  allocations.reduce((sum, item) => sum + (Number(item.releasedAmount) || 0), 0);
-
-const syncCampaignFreeze = (freeze) => {
-  if (!freeze) return null;
-
-  freeze.influencerAllocations = Array.isArray(freeze.influencerAllocations)
-    ? freeze.influencerAllocations
-    : [];
-
-  const totalFrozenAmount = Number(freeze.totalFrozenAmount || 0);
-  const totalAllocatedAmount = calcAllocationTotal(freeze.influencerAllocations);
-  const totalReleasedAmount = calcReleasedTotal(freeze.influencerAllocations);
-
-  freeze.totalAllocatedAmount = totalAllocatedAmount;
-  freeze.totalReleasedAmount = totalReleasedAmount;
-
-  freeze.currentFrozenAmount = Math.max(
-    0,
-    totalFrozenAmount - totalReleasedAmount
-  );
-
-  freeze.availableToAllocate = Math.max(
-    0,
-    totalFrozenAmount - totalAllocatedAmount
-  );
-
-  return freeze;
-};
-
-const calcFrozenAll = (freezes = []) =>
-  freezes.reduce((sum, freeze) => {
-    syncCampaignFreeze(freeze);
-    return sum + (Number(freeze.currentFrozenAmount) || 0);
-  }, 0);
-
-const syncUsableBalance = (wallet) => {
-  wallet.freezes = Array.isArray(wallet.freezes) ? wallet.freezes : [];
-  wallet.freezes.forEach(syncCampaignFreeze);
-
-  const frozenAll = calcFrozenAll(wallet.freezes || []);
-  wallet.usableBalance = Math.max(
-    0,
-    (Number(wallet.walletBalance) || 0) - frozenAll
-  );
-
-  return {
-    walletBalance: Number(wallet.walletBalance) || 0,
-    frozenBalance: frozenAll,
-    usableBalance: wallet.usableBalance,
-  };
-};
+const calcFrozenAll = (_freezes = []) => 0;
+const syncCampaignFreeze = (freeze) => freeze || null;
 
 const clean = (value) => String(value || "").trim();
 
@@ -216,6 +333,61 @@ const isSigned = (value) => {
   return true;
 };
 
+const isContractStatusSigned = (status) => {
+  const normalized = String(status || "").trim().toUpperCase();
+
+  return [
+    String(CONTRACT_STATUS.CONTRACT_SIGNED || "").toUpperCase(),
+    String(CONTRACT_STATUS.MILESTONES_CREATED || "").toUpperCase(),
+    "CONTRACT_SIGNED",
+    "MILESTONES_CREATED",
+    "SIGNED",
+    "LOCKED",
+  ].includes(normalized);
+};
+
+const isRoleSignedOnContract = (contractDoc = {}, role) => {
+  const legacyKey = role === "brand" ? "signatureBrand" : "signatureInfluencer";
+  const roleSignature = contractDoc.signatures?.[role] || {};
+
+  return Boolean(
+    isSigned(contractDoc?.[legacyKey]) ||
+      roleSignature.signed === true ||
+      roleSignature.signed === 1 ||
+      roleSignature.at
+  );
+};
+
+const isContractFullySignedForMilestone = async (contractDoc = {}) => {
+  if (!contractDoc) return false;
+
+  if (contractDoc.lockedAt || isContractStatusSigned(contractDoc.status)) {
+    return true;
+  }
+
+  const brandSignedOnContract = isRoleSignedOnContract(contractDoc, "brand");
+  const influencerSignedOnContract = isRoleSignedOnContract(contractDoc, "influencer");
+
+  if (brandSignedOnContract && influencerSignedOnContract) {
+    return true;
+  }
+
+  const contractId = String(contractDoc.contractId || contractDoc._id || "").trim();
+  if (!contractId) return false;
+
+  const signedRows = await ContractSignature.find({
+    contractId,
+    role: { $in: ["brand", "influencer"] },
+    signed: true,
+  })
+    .select("role signed")
+    .lean();
+
+  const signedRoles = new Set((signedRows || []).map((row) => String(row.role || "").toLowerCase()));
+
+  return signedRoles.has("brand") && signedRoles.has("influencer");
+};
+
 const normalizeAttachments = (input = []) => {
   return toArray(input)
     .map((item) => {
@@ -245,22 +417,24 @@ const normalizeDeliverables = (input = [], bodyDeliverableLink = "") => {
     .map((item) => {
       const deliverableName = clean(
         item?.deliverableName ||
-        item?.name ||
-        item?.title ||
-        item?.deliverableTitle
+          item?.name ||
+          item?.title ||
+          item?.deliverableTitle ||
+          item?.deliverableFormat
       );
 
       const deliveries = toArray(
         item?.deliveries ||
-        item?.delivery ||
-        item?.deliveryTypes ||
-        item?.contentFormats
+          item?.delivery ||
+          item?.deliveryTypes ||
+          item?.contentFormats ||
+          item?.deliverableFormat
       )
         .map(clean)
         .filter(Boolean);
 
       const platforms = toArray(
-        item?.platforms || item?.platform || item?.contentPlatforms
+        item?.platforms || item?.platform || item?.contentPlatforms || item?.platformHandle
       )
         .map(clean)
         .filter(Boolean);
@@ -269,6 +443,12 @@ const normalizeDeliverables = (input = [], bodyDeliverableLink = "") => {
         item?.quantity || item?.qty || item?.count || 1
       );
 
+      const draftRequired = boolValue(
+        item?.draftRequired || item?.needDraftFirst || item?.requiresDraft
+      );
+
+      const preShootScriptRequired = boolValue(item?.preShootScriptRequired);
+
       return {
         deliverableName,
         deliveries,
@@ -276,16 +456,49 @@ const normalizeDeliverables = (input = [], bodyDeliverableLink = "") => {
         platforms,
         quantity:
           Number.isFinite(quantityNum) && quantityNum > 0 ? quantityNum : 1,
-        deliverableLink: clean(
-          item?.deliverableLink ||
-          item?.link ||
-          item?.url ||
-          bodyDeliverableLink
+
+        deliverableLinks: normalizeDeliverableLinks(
+          item?.deliverableLinks ||
+            item?.submissionLinks ||
+            item?.deliverableLink ||
+            item?.link ||
+            item?.url ||
+            bodyDeliverableLink ||
+            []
         ),
+        submissionName: clean(item?.submissionName),
+        submissionNotes: clean(item?.submissionNotes || item?.additionalNotes || item?.notes),
+        additionalNotes: clean(item?.additionalNotes || item?.submissionNotes || item?.notes),
+        submittedAt: item?.submittedAt || null,
+        submittedByInfluencerId: clean(item?.submittedByInfluencerId),
+
+        draftRequired,
+        needDraftFirst: draftRequired,
+        requiresDraft: draftRequired,
+        draftDue: toDateOrNull(item?.draftDue || item?.draftDate),
+        draftDate: toDateOrNull(item?.draftDate || item?.draftDue),
+        draftLinks: normalizeDeliverableLinks(
+          item?.draftLinks || item?.draftUrl || item?.draftLink || []
+        ),
+        draftNotes: clean(item?.draftNotes),
+        draftSubmittedAt: item?.draftSubmittedAt || null,
+
+        preShootScriptRequired,
+        preShootScriptDue: toDateOrNull(item?.preShootScriptDue),
+        preShootScriptLinks: normalizeDeliverableLinks(
+          item?.preShootScriptLinks || item?.preShootScriptUrl || item?.preShootScriptLink || []
+        ),
+
+        contentSpecification: clean(item?.contentSpecification || item?.specification),
+        liveDate: toDateOrNull(item?.liveDate),
+
         status: clean(item?.status) || "pending",
         comments: clean(item?.comments),
         approvedRole: clean(item?.approvedRole),
         approvalId: clean(item?.approvalId),
+        approvedAt: item?.approvedAt || null,
+        revisionRequestedAt: item?.revisionRequestedAt || null,
+        revisions: Array.isArray(item?.revisions) ? item.revisions : [],
       };
     })
     .filter((item) => item.deliverableName);
@@ -414,61 +627,97 @@ exports.createMilestone = async (req, res) => {
       .filter((item) => item.url);
   };
 
-  const normalizeDeliverables = (input = []) => {
-    return toArray(input)
-      .map((item) => {
-        const deliverableName = clean(
-          item?.deliverableName ||
-            item?.name ||
-            item?.title ||
-            item?.deliverableTitle
-        );
+  const normalizeDeliverables = (input = [], bodyDeliverableLink = "") => {
+  return toArray(input)
+    .map((item) => {
+      const deliverableName = clean(
+        item?.deliverableName ||
+          item?.name ||
+          item?.title ||
+          item?.deliverableTitle ||
+          item?.deliverableFormat
+      );
 
-        const deliveries = toArray(
-          item?.deliveries ||
-            item?.delivery ||
-            item?.deliveryTypes ||
-            item?.contentFormats
-        )
-          .map(clean)
-          .filter(Boolean);
+      const deliveries = toArray(
+        item?.deliveries ||
+          item?.delivery ||
+          item?.deliveryTypes ||
+          item?.contentFormats ||
+          item?.deliverableFormat
+      )
+        .map(clean)
+        .filter(Boolean);
 
-        const platforms = toArray(
-          item?.platforms || item?.platform || item?.contentPlatforms
-        )
-          .map(clean)
-          .filter(Boolean);
+      const platforms = toArray(
+        item?.platforms || item?.platform || item?.contentPlatforms || item?.platformHandle
+      )
+        .map(clean)
+        .filter(Boolean);
 
-        const quantityNum = Number(
-          item?.quantity || item?.qty || item?.count || 1
-        );
+      const quantityNum = Number(
+        item?.quantity || item?.qty || item?.count || 1
+      );
 
-        return {
-          deliverableName,
-          deliveries,
-          aspectRatio: clean(item?.aspectRatio || item?.ratio),
-          platforms,
-          quantity:
-            Number.isFinite(quantityNum) && quantityNum > 0 ? quantityNum : 1,
+      const draftRequired = boolValue(
+        item?.draftRequired || item?.needDraftFirst || item?.requiresDraft
+      );
 
-          // Empty on milestone creation.
-          // Influencer will submit links later through submitDeliverable.
-          deliverableLinks: normalizeDeliverableLinks(
-            item?.deliverableLinks || []
-          ),
-          submittedAt: null,
+      const preShootScriptRequired = boolValue(item?.preShootScriptRequired);
 
-          status: clean(item?.status) || "pending",
-          comments: clean(item?.comments),
-          approvedRole: clean(item?.approvedRole),
-          approvalId: clean(item?.approvalId),
-          approvedAt: null,
-          revisionRequestedAt: null,
-          revisions: [],
-        };
-      })
-      .filter((item) => item.deliverableName);
-  };
+      return {
+        deliverableName,
+        deliveries,
+        aspectRatio: clean(item?.aspectRatio || item?.ratio),
+        platforms,
+        quantity:
+          Number.isFinite(quantityNum) && quantityNum > 0 ? quantityNum : 1,
+
+        deliverableLinks: normalizeDeliverableLinks(
+          item?.deliverableLinks ||
+            item?.submissionLinks ||
+            item?.deliverableLink ||
+            item?.link ||
+            item?.url ||
+            bodyDeliverableLink ||
+            []
+        ),
+        submissionName: clean(item?.submissionName),
+        submissionNotes: clean(item?.submissionNotes || item?.additionalNotes || item?.notes),
+        additionalNotes: clean(item?.additionalNotes || item?.submissionNotes || item?.notes),
+        submittedAt: item?.submittedAt || null,
+        submittedByInfluencerId: clean(item?.submittedByInfluencerId),
+
+        draftRequired,
+        needDraftFirst: draftRequired,
+        requiresDraft: draftRequired,
+        draftDue: toDateOrNull(item?.draftDue || item?.draftDate),
+        draftDate: toDateOrNull(item?.draftDate || item?.draftDue),
+        draftLinks: normalizeDeliverableLinks(
+          item?.draftLinks || item?.draftUrl || item?.draftLink || []
+        ),
+        draftNotes: clean(item?.draftNotes),
+        draftSubmittedAt: item?.draftSubmittedAt || null,
+
+        preShootScriptRequired,
+        preShootScriptDue: toDateOrNull(item?.preShootScriptDue),
+        preShootScriptLinks: normalizeDeliverableLinks(
+          item?.preShootScriptLinks || item?.preShootScriptUrl || item?.preShootScriptLink || []
+        ),
+
+        contentSpecification: clean(item?.contentSpecification || item?.specification),
+        liveDate: toDateOrNull(item?.liveDate),
+
+        status: clean(item?.status) || "pending",
+        comments: clean(item?.comments),
+        approvedRole: clean(item?.approvedRole),
+        approvalId: clean(item?.approvalId),
+        approvedAt: item?.approvedAt || null,
+        revisionRequestedAt: item?.revisionRequestedAt || null,
+        revisions: Array.isArray(item?.revisions) ? item.revisions : [],
+      };
+    })
+    .filter((item) => item.deliverableName);
+};
 
   try {
     const {
@@ -687,9 +936,7 @@ exports.createMilestone = async (req, res) => {
           );
         }
 
-        const canCreateMilestone =
-          isSigned(contractDoc.signatureBrand) &&
-          isSigned(contractDoc.signatureInfluencer);
+        const canCreateMilestone = await isContractFullySignedForMilestone(contractDoc);
 
         if (!canCreateMilestone) {
           abort(
@@ -749,21 +996,8 @@ exports.createMilestone = async (req, res) => {
           sameId(entry.campaignId, campaignId)
       );
 
-      if (previousMilestonesForInfluencerCampaign.length > 0) {
-        previousMilestonesForInfluencerCampaign.sort(
-          (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
-        );
-
-        const last = previousMilestonesForInfluencerCampaign[0];
-
-        if (!last.released) {
-          abort(
-            400,
-            "Cannot create new milestone until the previous milestone is released"
-          );
-        }
-      }
-
+      // Allow brand to create another milestone even if earlier milestones are not released.
+      // Budget and campaign wallet checks below still protect against over-allocation.
       existingTotalForInfluencerContract =
         previousMilestonesForInfluencerCampaign.reduce(
           (sum, entry) =>
@@ -818,92 +1052,40 @@ exports.createMilestone = async (req, res) => {
       }
 
       const wallet = await getOrCreateBrandWallet(brandId, session);
-
-      wallet.freezes = Array.isArray(wallet.freezes) ? wallet.freezes : [];
-
-      const campaignFreeze = wallet.freezes.find(
-        (freeze) =>
-          sameId(freeze.brandId, brandId) &&
-          sameId(freeze.campaignId, campaignId)
-      );
-
-      if (!campaignFreeze) {
-        abort(
-          400,
-          "No campaign wallet found. Please top up this campaign wallet first.",
-          {
-            walletBalance: Number(wallet.walletBalance || 0),
-            frozenBalance: calcFrozenAll(wallet.freezes || []),
-            usableBalance: Number(wallet.usableBalance || 0),
-            campaignId,
-            availableToAllocate: 0,
-            needToAdd: amountNum,
-          }
-        );
-      }
-
-      syncCampaignFreeze(campaignFreeze);
-
       const walletSnapBefore = syncUsableBalance(wallet);
-      const availableToAllocate = Number(
-        campaignFreeze.availableToAllocate || 0
-      );
 
-      if (availableToAllocate < amountNum) {
-        const needToAdd = Math.max(0, amountNum - availableToAllocate);
+      if (Number(walletSnapBefore.walletBalance || 0) < amountNum) {
+        const needToAdd = Math.max(
+          0,
+          amountNum - Number(walletSnapBefore.walletBalance || 0)
+        );
 
         abort(
-          400,
-          `Insufficient campaign frozen balance. Please add $${needToAdd.toFixed(
-            2
-          )} to this campaign wallet.`,
+          402,
+          "Insufficient brand wallet balance. Please top up the remaining amount.",
           {
             walletBalance: walletSnapBefore.walletBalance,
+            escrowBalance: walletSnapBefore.escrowBalance,
             frozenBalance: walletSnapBefore.frozenBalance,
             usableBalance: walletSnapBefore.usableBalance,
-            campaignId,
-            totalFrozenAmount: Number(campaignFreeze.totalFrozenAmount || 0),
-            currentFrozenAmount: Number(
-              campaignFreeze.currentFrozenAmount || 0
-            ),
-            totalAllocatedAmount: Number(
-              campaignFreeze.totalAllocatedAmount || 0
-            ),
-            totalReleasedAmount: Number(
-              campaignFreeze.totalReleasedAmount || 0
-            ),
-            availableToAllocate,
+            requiredAmount: amountNum,
             needToAdd,
           }
         );
       }
 
-      campaignFreeze.influencerAllocations = Array.isArray(
-        campaignFreeze.influencerAllocations
-      )
-        ? campaignFreeze.influencerAllocations
-        : [];
-
-      const allocationIndex = campaignFreeze.influencerAllocations.findIndex(
-        (allocation) => sameId(allocation.influencerId, influencerId)
-      );
-
-      if (allocationIndex >= 0) {
-        campaignFreeze.influencerAllocations[allocationIndex].amount =
-          Number(
-            campaignFreeze.influencerAllocations[allocationIndex].amount || 0
-          ) + amountNum;
-      } else {
-        campaignFreeze.influencerAllocations.push({
-          influencerId,
-          amount: amountNum,
-          releasedAmount: 0,
-        });
-      }
-
-      syncCampaignFreeze(campaignFreeze);
-
-      const walletSnapAfter = syncUsableBalance(wallet);
+      const walletSnapAfter = moveAmountToEscrow(wallet, {
+        amount: amountNum,
+        type: "milestone_escrow",
+        brandId,
+        campaignId,
+        influencerId,
+        contractId: isAdminMilestoneFinal
+          ? ""
+          : contractDoc?.contractId || resolvedContractId,
+        milestoneTitle: resolvedTitle,
+        note: "Milestone created; amount moved from brand wallet to escrow.",
+      });
 
       doc.milestoneHistory.push({
         influencerId,
@@ -1014,8 +1196,8 @@ exports.createMilestone = async (req, res) => {
 
       responsePayload = {
         message: isAdminMilestoneFinal
-          ? "Milestone created successfully by admin and amount allocated from campaign wallet"
-          : "Milestone created and amount allocated from campaign wallet successfully",
+          ? "Milestone created successfully by admin and amount moved to escrow"
+          : "Milestone created and amount moved to escrow successfully",
 
         milestoneId: String(doc._id),
         milestoneHistoryId: String(createdEntry._id),
@@ -1070,6 +1252,14 @@ exports.createMilestone = async (req, res) => {
             deliverableLinks: item.deliverableLinks || [],
             status: item.status || "pending",
             submittedAt: item.submittedAt || null,
+            submissionName: item.submissionName || "",
+            submissionNotes: item.submissionNotes || item.additionalNotes || "",
+            additionalNotes: item.additionalNotes || item.submissionNotes || "",
+            draftRequired: Boolean(item.draftRequired || item.needDraftFirst || item.requiresDraft || item.preShootScriptRequired),
+            draftLinks: item.draftLinks || [],
+            draftSubmittedAt: item.draftSubmittedAt || null,
+            preShootScriptRequired: Boolean(item.preShootScriptRequired),
+            preShootScriptLinks: item.preShootScriptLinks || [],
           })),
 
           isAccepted: createdEntry.isAccepted || 0,
@@ -1091,22 +1281,14 @@ exports.createMilestone = async (req, res) => {
 
         wallet: {
           walletBalance: walletSnapAfter.walletBalance,
+          escrowBalance: walletSnapAfter.escrowBalance,
           frozenBalance: walletSnapAfter.frozenBalance,
           usableBalance: walletSnapAfter.usableBalance,
         },
 
-        campaignWallet: {
-          campaignId,
-          totalFrozenAmount: Number(campaignFreeze.totalFrozenAmount || 0),
-          currentFrozenAmount: Number(campaignFreeze.currentFrozenAmount || 0),
-          totalAllocatedAmount: Number(
-            campaignFreeze.totalAllocatedAmount || 0
-          ),
-          totalReleasedAmount: Number(campaignFreeze.totalReleasedAmount || 0),
-          availableToAllocate: Number(
-            campaignFreeze.availableToAllocate || 0
-          ),
-          influencerAllocations: campaignFreeze.influencerAllocations || [],
+        escrow: {
+          amountMovedToEscrow: amountNum,
+          escrowBalance: walletSnapAfter.escrowBalance,
         },
 
         contractStatus: updatedContract?.status || null,
@@ -1415,66 +1597,57 @@ exports.editMilestone = async (req, res) => {
 
       if (amountDelta !== 0) {
         const wallet = await getOrCreateBrandWallet(doc.brandId, session);
-
-        wallet.freezes = Array.isArray(wallet.freezes) ? wallet.freezes : [];
-
-        const campaignFreeze = wallet.freezes.find(
-          (freeze) =>
-            sameId(freeze.brandId, doc.brandId) &&
-            sameId(freeze.campaignId, campaignId)
-        );
-
-        if (!campaignFreeze) {
-          abort(400, "No campaign wallet found for this campaign.");
-        }
-
-        syncCampaignFreeze(campaignFreeze);
+        const walletSnapBefore = syncUsableBalance(wallet);
 
         if (amountDelta > 0) {
-          if (Number(campaignFreeze.availableToAllocate || 0) < amountDelta) {
+          if (Number(walletSnapBefore.walletBalance || 0) < amountDelta) {
+            const needToAdd = Math.max(
+              0,
+              amountDelta - Number(walletSnapBefore.walletBalance || 0)
+            );
+
             abort(
-              400,
-              `Insufficient campaign frozen balance. Please add $${amountDelta.toFixed(
-                2
-              )} to this campaign wallet.`,
+              402,
+              "Insufficient brand wallet balance. Please top up the remaining amount.",
               {
-                needToAdd: amountDelta,
-                availableToAllocate: Number(
-                  campaignFreeze.availableToAllocate || 0
-                ),
+                walletBalance: walletSnapBefore.walletBalance,
+                escrowBalance: walletSnapBefore.escrowBalance,
+                frozenBalance: walletSnapBefore.frozenBalance,
+                usableBalance: walletSnapBefore.usableBalance,
+                requiredAmount: amountDelta,
+                needToAdd,
               }
             );
           }
-        }
 
-        campaignFreeze.influencerAllocations = Array.isArray(
-          campaignFreeze.influencerAllocations
-        )
-          ? campaignFreeze.influencerAllocations
-          : [];
-
-        const allocationIndex = campaignFreeze.influencerAllocations.findIndex(
-          (allocation) => sameId(allocation.influencerId, influencerId)
-        );
-
-        if (allocationIndex >= 0) {
-          const currentAllocation = Number(
-            campaignFreeze.influencerAllocations[allocationIndex].amount || 0
-          );
-
-          campaignFreeze.influencerAllocations[allocationIndex].amount =
-            Math.max(0, currentAllocation + amountDelta);
-        } else if (amountDelta > 0) {
-          campaignFreeze.influencerAllocations.push({
-            influencerId,
+          moveAmountToEscrow(wallet, {
             amount: amountDelta,
-            releasedAmount: 0,
+            type: "milestone_escrow_adjustment",
+            brandId: doc.brandId,
+            campaignId,
+            influencerId,
+            contractId: contractDoc?.contractId || entry.contractId || "",
+            milestoneId: resolvedMilestoneId,
+            milestoneHistoryId: resolvedHistoryId,
+            milestoneTitle: resolvedTitle,
+            note: "Milestone amount increased; additional amount moved to escrow.",
+          });
+        } else {
+          refundAmountFromEscrow(wallet, {
+            amount: Math.abs(amountDelta),
+            type: "milestone_escrow_refund",
+            brandId: doc.brandId,
+            campaignId,
+            influencerId,
+            contractId: contractDoc?.contractId || entry.contractId || "",
+            milestoneId: resolvedMilestoneId,
+            milestoneHistoryId: resolvedHistoryId,
+            milestoneTitle: resolvedTitle,
+            note: "Milestone amount reduced before release; difference returned from escrow to wallet.",
           });
         }
 
-        syncCampaignFreeze(campaignFreeze);
         syncUsableBalance(wallet);
-
         await wallet.save({ session });
 
         doc.totalAmount = Math.max(0, Number(doc.totalAmount || 0) + amountDelta);
@@ -1521,6 +1694,10 @@ exports.editMilestone = async (req, res) => {
             platforms: item.platforms,
             quantity: item.quantity,
             status: item.status,
+            submissionName: item.submissionName || "",
+            submissionNotes: item.submissionNotes || item.additionalNotes || "",
+            additionalNotes: item.additionalNotes || item.submissionNotes || "",
+            submittedAt: item.submittedAt || null,
           })),
 
           startDate: entry.startDate,
@@ -1910,6 +2087,106 @@ exports.getWalletBalance = async (req, res) => {
   }
 };
 
+
+// ======================================================================
+// POST /milestone/submitMilestone
+// body: { milestoneId, milestoneHistoryId, influencerId }
+// Allows influencer to submit a milestone only after all deliverables under it are submitted.
+// ======================================================================
+exports.submitMilestone = async (req, res) => {
+  try {
+    const { milestoneId, milestoneHistoryId, influencerId } = req.body || {};
+
+    if (!milestoneId || !milestoneHistoryId || !influencerId) {
+      return res.status(400).json({
+        success: false,
+        message: "milestoneId, milestoneHistoryId and influencerId are required",
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(String(milestoneId))) {
+      return res.status(400).json({ success: false, message: "Invalid milestoneId" });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(String(milestoneHistoryId))) {
+      return res.status(400).json({ success: false, message: "Invalid milestoneHistoryId" });
+    }
+
+    const milestoneDoc = await Milestone.findById(milestoneId);
+
+    if (!milestoneDoc) {
+      return res.status(404).json({ success: false, message: "Milestone not found" });
+    }
+
+    const milestoneHistory = milestoneDoc.milestoneHistory.id(milestoneHistoryId);
+
+    if (!milestoneHistory) {
+      return res.status(404).json({ success: false, message: "Milestone history not found" });
+    }
+
+    if (!sameId(milestoneHistory.influencerId, influencerId)) {
+      return res.status(403).json({
+        success: false,
+        message: "This milestone does not belong to this influencer",
+      });
+    }
+
+    if (!canSubmitMilestoneHistory(milestoneHistory)) {
+      return res.status(400).json({
+        success: false,
+        message: "Submit all deliverables under this milestone before submitting the milestone.",
+        totalDeliverables: Array.isArray(milestoneHistory.deliverables) ? milestoneHistory.deliverables.length : 0,
+        submittedDeliverables: Array.isArray(milestoneHistory.deliverables)
+          ? milestoneHistory.deliverables.filter(isDeliverableSubmittedForMilestone).length
+          : 0,
+      });
+    }
+
+    milestoneHistory.status = "submitted";
+    milestoneHistory.submissionStatus = "submitted";
+    milestoneHistory.milestoneSubmissionStatus = "submitted";
+    milestoneHistory.isMilestoneSubmitted = true;
+    milestoneHistory.submittedAt = milestoneHistory.submittedAt || new Date();
+    milestoneHistory.milestoneSubmittedAt =
+      milestoneHistory.milestoneSubmittedAt || milestoneHistory.submittedAt;
+    milestoneHistory.submittedByInfluencerId = String(influencerId);
+
+    milestoneDoc.markModified("milestoneHistory");
+    await milestoneDoc.save();
+
+    createAndEmit({
+      brandId: milestoneDoc.brandId,
+      type: "milestone.submitted",
+      title: `Milestone submitted: ${milestoneHistory.milestoneTitle || "Milestone"}`,
+      message: "Influencer has submitted all deliverables under this milestone.",
+      entityType: "campaign",
+      entityId: String(milestoneHistory.campaignId),
+      actionPath: `/brand/active-campaign`,
+    }).catch((e) => console.error("notify brand (milestone submitted) failed:", e));
+
+    return res.status(200).json({
+      success: true,
+      message: "Milestone submitted successfully",
+      milestoneId: String(milestoneDoc._id),
+      milestoneHistoryId: String(milestoneHistory._id),
+      status: milestoneHistory.status,
+      submissionStatus: milestoneHistory.submissionStatus,
+      isMilestoneSubmitted: milestoneHistory.isMilestoneSubmitted,
+      submittedAt: milestoneHistory.submittedAt,
+      milestoneSubmittedAt: milestoneHistory.milestoneSubmittedAt,
+      submittedByInfluencerId: milestoneHistory.submittedByInfluencerId,
+    });
+  } catch (err) {
+    console.error("Error in submitMilestone:", err);
+    await saveErrorLog(req, err, err?.statusCode || err?.status || err?.statusCode || 500, "SUBMIT_MILESTONE_ERROR");
+
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  }
+};
+
 // ======================================================================
 // POST /milestone/release
 // body: { milestoneId, milestoneHistoryId }
@@ -1942,66 +2219,55 @@ exports.releaseMilestone = async (req, res) => {
       return res.status(400).json({ message: "This milestone has already been released." });
     }
 
-    const wallet = await getOrCreateBrandWallet(doc.brandId);
+    const milestoneSubmissionStatus = String(
+      entry.submissionStatus ||
+        entry.milestoneSubmissionStatus ||
+        entry.status ||
+        ""
+    )
+      .trim()
+      .toLowerCase();
 
-    const freezeIndex = (wallet.freezes || []).findIndex(
-      (f) =>
-        String(f.brandId) === String(doc.brandId) &&
-        String(f.campaignId) === String(entry.campaignId)
+    const milestoneSubmittedByInfluencer = Boolean(
+      entry.isMilestoneSubmitted === true ||
+        entry.submittedAt ||
+        entry.milestoneSubmittedAt ||
+        entry.submittedByInfluencerId ||
+        milestoneSubmissionStatus === "submitted" ||
+        milestoneSubmissionStatus === "milestone_submitted" ||
+        milestoneSubmissionStatus === "ready_for_brand_review"
     );
 
-    if (freezeIndex < 0) {
+    if (!milestoneSubmittedByInfluencer) {
       return res.status(400).json({
-        message: "Frozen amount not found for this campaign.",
+        message:
+          "Influencer must submit the milestone before payment can be released.",
       });
     }
 
-    const campaignFreeze = wallet.freezes[freezeIndex];
-    syncCampaignFreeze(campaignFreeze);
-
-    const frozenAmount = Number(campaignFreeze.currentFrozenAmount || 0);
+    const wallet = await getOrCreateBrandWallet(doc.brandId);
     const releaseAmount = Number(entry.amount || 0);
 
-    if (frozenAmount < releaseAmount) {
-      return res.status(400).json({
-        message: "Frozen amount is less than milestone amount.",
-        frozenAmount,
-        releaseAmount,
-      });
-    }
-
-    campaignFreeze.influencerAllocations = Array.isArray(campaignFreeze.influencerAllocations)
-      ? campaignFreeze.influencerAllocations
-      : [];
-
-    const allocationIndex = campaignFreeze.influencerAllocations.findIndex(
-      (a) => String(a.influencerId) === String(entry.influencerId)
-    );
-
-    if (allocationIndex >= 0) {
-      campaignFreeze.influencerAllocations[allocationIndex].releasedAmount =
-        Number(campaignFreeze.influencerAllocations[allocationIndex].releasedAmount || 0) +
-        releaseAmount;
-    } else {
-      campaignFreeze.influencerAllocations.push({
+    let walletSnap;
+    try {
+      walletSnap = releaseAmountFromEscrow(wallet, {
+        amount: releaseAmount,
+        brandId: doc.brandId,
+        campaignId: entry.campaignId,
         influencerId: entry.influencerId,
-        amount: 0,
-        releasedAmount: releaseAmount,
+        contractId: entry.contractId || "",
+        milestoneId,
+        milestoneHistoryId,
+        milestoneTitle: entry.milestoneTitle || "",
+        note: "Milestone released; escrow amount marked for payout.",
+      });
+    } catch (releaseErr) {
+      return res.status(releaseErr.status || 400).json({
+        message: releaseErr.message,
+        ...(releaseErr.extra || {}),
       });
     }
 
-    syncCampaignFreeze(campaignFreeze);
-
-    if (Number(campaignFreeze.currentFrozenAmount || 0) === 0) {
-      wallet.freezes.splice(freezeIndex, 1);
-    }
-
-    wallet.walletBalance = Math.max(
-      0,
-      (Number(wallet.walletBalance) || 0) - releaseAmount
-    );
-
-    const walletSnap = syncUsableBalance(wallet);
     await wallet.save();
 
     entry.released = true;
@@ -2062,8 +2328,26 @@ exports.releaseMilestone = async (req, res) => {
       message: "Milestone released successfully (payout initiated).",
       releasedAmount: entry.amount,
       payoutStatus: entry.payoutStatus,
+      milestone: {
+        milestoneId: String(doc._id),
+        milestoneHistoryId: String(entry._id),
+        milestoneTitle: entry.milestoneTitle || "",
+        milestoneDescription: entry.milestoneDescription || "",
+        amount: Number(entry.amount || entry.milestoneBudget || 0),
+        milestoneBudget: Number(entry.milestoneBudget || entry.amount || 0),
+        status: entry.status || "submitted",
+        submissionStatus: entry.submissionStatus || "submitted",
+        isMilestoneSubmitted: Boolean(entry.isMilestoneSubmitted),
+        submittedAt: entry.submittedAt || null,
+        milestoneSubmittedAt: entry.milestoneSubmittedAt || null,
+        submittedByInfluencerId: entry.submittedByInfluencerId || "",
+        released: entry.released,
+        releasedAt: entry.releasedAt,
+        payoutStatus: entry.payoutStatus,
+      },
       wallet: {
         walletBalance: walletSnap.walletBalance,
+        escrowBalance: walletSnap.escrowBalance,
         frozenBalance: walletSnap.frozenBalance,
         usableBalance: walletSnap.usableBalance,
       },
@@ -2513,6 +2797,128 @@ exports.getPayoutDetailsByInfluencer = async (req, res) => {
 
 
 
+
+const isDeliverableSubmittedForMilestone = (deliverable) => {
+  const status = String(deliverable?.status || "").toLowerCase();
+  const links = Array.isArray(deliverable?.deliverableLinks)
+    ? deliverable.deliverableLinks.filter((item) => clean(item?.url)).length
+    : 0;
+
+  return links > 0 || ["submitted", "approved", "completed", "complete", "paid"].some((item) => status.includes(item));
+};
+
+const canSubmitMilestoneHistory = (milestoneHistory = {}) => {
+  const deliverables = Array.isArray(milestoneHistory.deliverables)
+    ? milestoneHistory.deliverables
+    : [];
+
+  return deliverables.length > 0 && deliverables.every(isDeliverableSubmittedForMilestone);
+};
+
+const mapDeliverableForResponse = (item, milestoneDoc, milestoneHistory) => ({
+  deliverableId: String(item._id),
+
+  milestoneId: String(milestoneDoc._id),
+  milestoneHistoryId: String(milestoneHistory._id),
+
+  brandId: String(milestoneDoc.brandId || ""),
+  influencerId: String(milestoneHistory.influencerId || ""),
+  campaignId: String(milestoneHistory.campaignId || ""),
+
+  milestoneTitle: milestoneHistory.milestoneTitle || "",
+  milestoneDescription: milestoneHistory.milestoneDescription || "",
+  milestoneBudget: Number(milestoneHistory.milestoneBudget || milestoneHistory.amount || 0),
+  amount: Number(milestoneHistory.amount || milestoneHistory.milestoneBudget || 0),
+  milestoneStatus: milestoneHistory.status || milestoneHistory.payoutStatus || "pending",
+  canSubmitMilestone: canSubmitMilestoneHistory(milestoneHistory),
+
+  deliverableName: item.deliverableName || "",
+  title: item.deliverableName || "",
+
+  deliveries: item.deliveries || [],
+  aspectRatio: item.aspectRatio || "",
+  platforms: item.platforms || [],
+  quantity: item.quantity || 1,
+
+  deliverableLinks: Array.isArray(item.deliverableLinks)
+    ? item.deliverableLinks.map((link) => ({
+        linkId: String(link._id || ""),
+        label: link.label || "",
+        url: link.url || "",
+      }))
+    : [],
+
+  submissionName: item.submissionName || item.deliverableName || "",
+  submissionNotes: item.submissionNotes || item.additionalNotes || item.comments || "",
+  additionalNotes: item.additionalNotes || item.submissionNotes || item.comments || "",
+  submittedAt: item.submittedAt || null,
+  submittedByInfluencerId: item.submittedByInfluencerId || "",
+  hasSubmittedDeliverable: isDeliverableSubmittedForMilestone(item),
+  deliverableSubmissionVisible: isDeliverableSubmittedForMilestone(item),
+
+  draftRequired: Boolean(item.draftRequired || item.needDraftFirst || item.requiresDraft || item.preShootScriptRequired),
+  needDraftFirst: Boolean(item.needDraftFirst || item.draftRequired),
+  requiresDraft: Boolean(item.requiresDraft || item.draftRequired),
+  draftDue: item.draftDue || item.draftDate || null,
+  draftDate: item.draftDate || item.draftDue || null,
+  draftLinks: Array.isArray(item.draftLinks)
+    ? item.draftLinks.map((link) => ({
+        linkId: String(link._id || ""),
+        label: link.label || "",
+        url: link.url || "",
+      }))
+    : [],
+  draftNotes: item.draftNotes || "",
+  draftSubmittedAt: item.draftSubmittedAt || null,
+
+  preShootScriptRequired: Boolean(item.preShootScriptRequired),
+  preShootScriptDue: item.preShootScriptDue || null,
+  preShootScriptLinks: Array.isArray(item.preShootScriptLinks)
+    ? item.preShootScriptLinks.map((link) => ({
+        linkId: String(link._id || ""),
+        label: link.label || "",
+        url: link.url || "",
+      }))
+    : [],
+
+  contentSpecification: item.contentSpecification || "",
+  liveDate: item.liveDate || null,
+
+  status: item.status || "pending",
+  submittedStatus: item.status || "pending",
+
+  comments: item.comments || "",
+  approvedRole: item.approvedRole || "",
+  approvalId: item.approvalId || "",
+  approvedAt: item.approvedAt || null,
+  revisionRequestedAt: item.revisionRequestedAt || null,
+
+  revisions: Array.isArray(item.revisions)
+    ? item.revisions.map((revision) => ({
+        revisionId: String(revision._id),
+        deliverableId: String(revision.deliverableId || item._id),
+        issueName: revision.issueName || "",
+        revisionType: revision.revisionType || "free",
+        revisionBudget: Number(revision.revisionBudget || 0),
+        deliveryName: revision.deliveryName || "",
+        issueDeliverableLink: revision.issueDeliverableLink || "",
+        notes: revision.notes || "",
+        attachments: revision.attachments || [],
+        submissionDate: revision.submissionDate || null,
+        status: revision.status || "pending",
+        submittedAt: revision.submittedAt || null,
+        approvedAt: revision.approvedAt || null,
+        raisedByRole: revision.raisedByRole || "Brand",
+        raisedAt: revision.raisedAt || null,
+        createdAt: revision.createdAt || null,
+        updatedAt: revision.updatedAt || null,
+      }))
+    : [],
+
+  createdAt: item.createdAt || null,
+  updatedAt: item.updatedAt || null,
+});
+
 // ======================================================================
 // POST /milestone/getAllDeliverables
 // body: { milestoneId, milestoneHistoryId }
@@ -2562,79 +2968,22 @@ exports.getAllDeliverablesByMilestone = async (req, res) => {
       });
     }
 
-    const data = (milestoneHistory.deliverables || []).map((item) => ({
-      deliverableId: String(item._id),
+    const data = (milestoneHistory.deliverables || []).map((item) =>
+      mapDeliverableForResponse(item, milestoneDoc, milestoneHistory)
+    );
 
-      milestoneId: String(milestoneDoc._id),
-      milestoneHistoryId: String(milestoneHistory._id),
-
-      brandId: String(milestoneDoc.brandId || ""),
-      influencerId: String(milestoneHistory.influencerId || ""),
-      campaignId: String(milestoneHistory.campaignId || ""),
-
-      milestoneTitle: milestoneHistory.milestoneTitle || "",
-
-      deliverableName: item.deliverableName || "",
-      title: item.deliverableName || "",
-
-      deliveries: item.deliveries || [],
-      aspectRatio: item.aspectRatio || "",
-      platforms: item.platforms || [],
-      quantity: item.quantity || 1,
-
-      deliverableLinks: Array.isArray(item.deliverableLinks)
-        ? item.deliverableLinks.map((link) => ({
-          label: link.label || "",
-          url: link.url || "",
-        }))
-        : [],
-
-      url: Array.isArray(item.deliverableLinks)
-        ? item.deliverableLinks.map((link) => ({
-          label: link.label || "",
-          url: link.url || "",
-        }))
-        : [],
-
-      status: item.status || "pending",
-      submittedAt: item.submittedAt || null,
-
-      comments: item.comments || "",
-      approvedRole: item.approvedRole || "",
-      approvalId: item.approvalId || "",
-      approvedAt: item.approvedAt || null,
-      revisionRequestedAt: item.revisionRequestedAt || null,
-
-      revisions: Array.isArray(item.revisions)
-        ? item.revisions.map((revision) => ({
-          revisionId: String(revision._id),
-          deliverableId: String(revision.deliverableId || item._id),
-          issueName: revision.issueName || "",
-          revisionType: revision.revisionType || "free",
-          revisionBudget: Number(revision.revisionBudget || 0),
-          deliveryName: revision.deliveryName || "",
-          issueDeliverableLink: revision.issueDeliverableLink || "",
-          notes: revision.notes || "",
-          attachments: revision.attachments || [],
-          submissionDate: revision.submissionDate || null,
-          status: revision.status || "pending",
-          raisedByRole: revision.raisedByRole || "Brand",
-          raisedAt: revision.raisedAt || null,
-          createdAt: revision.createdAt || null,
-          updatedAt: revision.updatedAt || null,
-        }))
-        : [],
-
-      createdAt: item.createdAt || null,
-      updatedAt: item.updatedAt || null,
-    }));
+    const submittedCount = data.filter((item) => item.hasSubmittedDeliverable).length;
+    const canSubmitMilestone = data.length > 0 && submittedCount === data.length;
 
     return res.status(200).json({
       success: true,
       message: "Deliverables fetched successfully by milestone.",
       total: data.length,
       count: data.length,
-      data: data,
+      submittedCount,
+      pendingCount: Math.max(0, data.length - submittedCount),
+      canSubmitMilestone,
+      data,
       filters: {
         milestoneId: String(milestoneDoc._id),
         milestoneHistoryId: String(milestoneHistory._id),
@@ -2643,8 +2992,8 @@ exports.getAllDeliverablesByMilestone = async (req, res) => {
   } catch (err) {
     console.error("Error in getAllDeliverablesByMilestone:", err);
 
-    
-    await saveErrorLog(req, err, err?.statusCode || err?.status || err?.statusCode || 500, "GET_ALL_DELIVERABLES_BY_MILESTONE_ERROR");return res.status(500).json({
+    await saveErrorLog(req, err, err?.statusCode || err?.status || err?.statusCode || 500, "GET_ALL_DELIVERABLES_BY_MILESTONE_ERROR");
+    return res.status(500).json({
       success: false,
       message: "Internal server error",
     });
@@ -2874,92 +3223,27 @@ exports.addRevision = async (req, res) => {
           session
         );
 
-        wallet.freezes = Array.isArray(wallet.freezes) ? wallet.freezes : [];
-
-        const campaignFreeze = wallet.freezes.find(
-          (freeze) =>
-            sameId(freeze.brandId, milestoneDoc.brandId) &&
-            sameId(freeze.campaignId, milestoneHistory.campaignId)
-        );
-
-        if (!campaignFreeze) {
-          abort(
-            400,
-            "No campaign wallet found. Please add funds for this campaign to raise a paid revision.",
-            {
-              walletBalance: Number(wallet.walletBalance || 0),
-              frozenBalance: calcFrozenAll(wallet.freezes || []),
-              usableBalance: Number(wallet.usableBalance || 0),
-              campaignId: String(milestoneHistory.campaignId),
-              availableToAllocate: 0,
-              needToAdd: revisionBudgetNum,
-              requestedRevisionBudget: revisionBudgetNum,
-            }
-          );
-        }
-
-        syncCampaignFreeze(campaignFreeze);
-
         const walletSnapBefore = syncUsableBalance(wallet);
-        const availableToAllocate = Number(
-          campaignFreeze.availableToAllocate || 0
-        );
 
-        if (availableToAllocate < revisionBudgetNum) {
+        if (Number(walletSnapBefore.walletBalance || 0) < revisionBudgetNum) {
           const needToAdd = Math.max(
             0,
-            revisionBudgetNum - availableToAllocate
+            revisionBudgetNum - Number(walletSnapBefore.walletBalance || 0)
           );
 
           abort(
-            400,
-            `Insufficient campaign frozen balance. Please add $${needToAdd.toFixed(
-              2
-            )} to this campaign wallet to raise revision.`,
+            402,
+            "Insufficient brand wallet balance. Please top up the remaining amount to raise revision.",
             {
               walletBalance: walletSnapBefore.walletBalance,
+              escrowBalance: walletSnapBefore.escrowBalance,
               frozenBalance: walletSnapBefore.frozenBalance,
               usableBalance: walletSnapBefore.usableBalance,
-              campaignId: String(milestoneHistory.campaignId),
-              totalFrozenAmount: Number(campaignFreeze.totalFrozenAmount || 0),
-              currentFrozenAmount: Number(
-                campaignFreeze.currentFrozenAmount || 0
-              ),
-              totalAllocatedAmount: Number(
-                campaignFreeze.totalAllocatedAmount || 0
-              ),
-              totalReleasedAmount: Number(
-                campaignFreeze.totalReleasedAmount || 0
-              ),
-              availableToAllocate,
+              requiredAmount: revisionBudgetNum,
               needToAdd,
               requestedRevisionBudget: revisionBudgetNum,
             }
           );
-        }
-
-        campaignFreeze.influencerAllocations = Array.isArray(
-          campaignFreeze.influencerAllocations
-        )
-          ? campaignFreeze.influencerAllocations
-          : [];
-
-        const allocationIndex =
-          campaignFreeze.influencerAllocations.findIndex((allocation) =>
-            sameId(allocation.influencerId, milestoneHistory.influencerId)
-          );
-
-        if (allocationIndex >= 0) {
-          campaignFreeze.influencerAllocations[allocationIndex].amount =
-            Number(
-              campaignFreeze.influencerAllocations[allocationIndex].amount || 0
-            ) + revisionBudgetNum;
-        } else {
-          campaignFreeze.influencerAllocations.push({
-            influencerId: milestoneHistory.influencerId,
-            amount: revisionBudgetNum,
-            releasedAmount: 0,
-          });
         }
 
         const updatedMilestoneBudget =
@@ -2971,35 +3255,31 @@ exports.addRevision = async (req, res) => {
         milestoneDoc.totalAmount =
           Number(milestoneDoc.totalAmount || 0) + revisionBudgetNum;
 
-        syncCampaignFreeze(campaignFreeze);
-
-        const walletSnapAfter = syncUsableBalance(wallet);
+        const walletSnapAfter = moveAmountToEscrow(wallet, {
+          amount: revisionBudgetNum,
+          type: "milestone_escrow_adjustment",
+          brandId: milestoneDoc.brandId,
+          campaignId: milestoneHistory.campaignId,
+          influencerId: milestoneHistory.influencerId,
+          contractId: milestoneHistory.contractId || "",
+          milestoneId: String(milestoneDoc._id),
+          milestoneHistoryId: String(milestoneHistory._id),
+          milestoneTitle: milestoneHistory.milestoneTitle || "",
+          note: "Paid revision raised; revision amount moved from brand wallet to escrow.",
+        });
 
         await wallet.save({ session });
 
         walletPayload = {
           wallet: {
             walletBalance: walletSnapAfter.walletBalance,
+            escrowBalance: walletSnapAfter.escrowBalance,
             frozenBalance: walletSnapAfter.frozenBalance,
             usableBalance: walletSnapAfter.usableBalance,
           },
-          campaignWallet: {
-            campaignId: String(milestoneHistory.campaignId),
-            totalFrozenAmount: Number(campaignFreeze.totalFrozenAmount || 0),
-            currentFrozenAmount: Number(
-              campaignFreeze.currentFrozenAmount || 0
-            ),
-            totalAllocatedAmount: Number(
-              campaignFreeze.totalAllocatedAmount || 0
-            ),
-            totalReleasedAmount: Number(
-              campaignFreeze.totalReleasedAmount || 0
-            ),
-            availableToAllocate: Number(
-              campaignFreeze.availableToAllocate || 0
-            ),
-            influencerAllocations:
-              campaignFreeze.influencerAllocations || [],
+          escrow: {
+            amountMovedToEscrow: revisionBudgetNum,
+            escrowBalance: walletSnapAfter.escrowBalance,
           },
         };
       }
@@ -3139,62 +3419,44 @@ exports.submitDeliverable = async (req, res) => {
       deliverableId,
       revisionId,
       deliverableLinks,
+      submissionType = "final",
+      submissionName = "",
+      notes = "",
+      additionalNotes = "",
     } = req.body || {};
 
+    const normalizedSubmissionType = String(submissionType || "final").toLowerCase() === "draft" ? "draft" : "final";
+
     if (!influencerId) {
-      return res.status(400).json({
-        success: false,
-        message: "influencerId is required",
-      });
+      return res.status(400).json({ success: false, message: "influencerId is required" });
     }
 
     if (!milestoneId) {
-      return res.status(400).json({
-        success: false,
-        message: "milestoneId is required",
-      });
+      return res.status(400).json({ success: false, message: "milestoneId is required" });
     }
 
     if (!milestoneHistoryId) {
-      return res.status(400).json({
-        success: false,
-        message: "milestoneHistoryId is required",
-      });
+      return res.status(400).json({ success: false, message: "milestoneHistoryId is required" });
     }
 
     if (!deliverableId) {
-      return res.status(400).json({
-        success: false,
-        message: "deliverableId is required",
-      });
+      return res.status(400).json({ success: false, message: "deliverableId is required" });
     }
 
     if (!mongoose.Types.ObjectId.isValid(String(milestoneId))) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid milestoneId",
-      });
+      return res.status(400).json({ success: false, message: "Invalid milestoneId" });
     }
 
     if (!mongoose.Types.ObjectId.isValid(String(milestoneHistoryId))) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid milestoneHistoryId",
-      });
+      return res.status(400).json({ success: false, message: "Invalid milestoneHistoryId" });
     }
 
     if (!mongoose.Types.ObjectId.isValid(String(deliverableId))) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid deliverableId",
-      });
+      return res.status(400).json({ success: false, message: "Invalid deliverableId" });
     }
 
     if (revisionId && !mongoose.Types.ObjectId.isValid(String(revisionId))) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid revisionId",
-      });
+      return res.status(400).json({ success: false, message: "Invalid revisionId" });
     }
 
     const normalizedLinks = normalizeDeliverableLinks(
@@ -3211,19 +3473,13 @@ exports.submitDeliverable = async (req, res) => {
     const milestoneDoc = await Milestone.findById(milestoneId);
 
     if (!milestoneDoc) {
-      return res.status(404).json({
-        success: false,
-        message: "Milestone not found",
-      });
+      return res.status(404).json({ success: false, message: "Milestone not found" });
     }
 
     const milestoneHistory = milestoneDoc.milestoneHistory.id(milestoneHistoryId);
 
     if (!milestoneHistory) {
-      return res.status(404).json({
-        success: false,
-        message: "Milestone history not found",
-      });
+      return res.status(404).json({ success: false, message: "Milestone history not found" });
     }
 
     if (String(milestoneHistory.influencerId) !== String(influencerId)) {
@@ -3236,16 +3492,50 @@ exports.submitDeliverable = async (req, res) => {
     const deliverable = milestoneHistory.deliverables.id(deliverableId);
 
     if (!deliverable) {
-      return res.status(404).json({
-        success: false,
-        message: "Deliverable not found",
-      });
+      return res.status(404).json({ success: false, message: "Deliverable not found" });
     }
 
-    if (String(deliverable.status || "").toLowerCase() === "approved") {
+    if (String(deliverable.status || "").toLowerCase() === "approved" && normalizedSubmissionType === "final") {
       return res.status(400).json({
         success: false,
         message: "Approved deliverable cannot be submitted again",
+      });
+    }
+
+    if (normalizedSubmissionType === "draft") {
+      const draftAllowed = Boolean(
+        deliverable.draftRequired ||
+          deliverable.needDraftFirst ||
+          deliverable.requiresDraft ||
+          deliverable.preShootScriptRequired ||
+          milestoneHistory.needDraftFirst
+      );
+
+      if (!draftAllowed) {
+        return res.status(400).json({
+          success: false,
+          message: "Draft submission is not required for this deliverable.",
+        });
+      }
+
+      deliverable.draftLinks = normalizedLinks;
+      deliverable.draftNotes = clean(notes || additionalNotes);
+      deliverable.draftSubmittedAt = new Date();
+      deliverable.submissionName = clean(submissionName) || deliverable.deliverableName;
+
+      if (!["submitted", "approved"].includes(String(deliverable.status || "").toLowerCase())) {
+        deliverable.status = "draft_submitted";
+      }
+
+      await milestoneDoc.save();
+
+      return res.status(200).json({
+        success: true,
+        message: "Draft submitted successfully",
+        milestoneId: String(milestoneDoc._id),
+        milestoneHistoryId: String(milestoneHistory._id),
+        deliverableId: String(deliverable._id),
+        deliverable: mapDeliverableForResponse(deliverable, milestoneDoc, milestoneHistory),
       });
     }
 
@@ -3266,27 +3556,16 @@ exports.submitDeliverable = async (req, res) => {
     let updatedRevision = null;
 
     if (isRevisionSubmission) {
-      const revisions = Array.isArray(deliverable.revisions)
-        ? deliverable.revisions
-        : [];
+      const revisions = Array.isArray(deliverable.revisions) ? deliverable.revisions : [];
 
       if (revisionId) {
         updatedRevision = deliverable.revisions.id(revisionId) || null;
       } else {
         updatedRevision = [...revisions]
           .reverse()
-          .find((item) =>
-            ["pending", "revision"].includes(
-              String(item.status || "").toLowerCase()
-            )
-          ) || null;
+          .find((item) => ["pending", "revision"].includes(String(item.status || "").toLowerCase())) || null;
       }
 
-      // Important:
-      // Admin-created campaigns may raise revision by only changing
-      // deliverable.status = "revision", without creating a revision row.
-      // So do NOT return "Revision not found" here.
-      // Just submit the revised deliverable links and set deliverable status to submitted.
       if (updatedRevision) {
         updatedRevision.status = "submitted";
         updatedRevision.submittedAt = new Date();
@@ -3294,8 +3573,17 @@ exports.submitDeliverable = async (req, res) => {
     }
 
     deliverable.deliverableLinks = normalizedLinks;
+    deliverable.submissionName = clean(submissionName) || deliverable.deliverableName;
+    deliverable.submissionNotes = clean(notes || additionalNotes);
+    deliverable.additionalNotes = clean(additionalNotes || notes);
     deliverable.status = "submitted";
     deliverable.submittedAt = new Date();
+    deliverable.submittedByInfluencerId = String(influencerId);
+
+    const allSubmitted = canSubmitMilestoneHistory(milestoneHistory);
+    if (allSubmitted && !milestoneHistory.submittedAt) {
+      milestoneHistory.status = "ready_for_brand_review";
+    }
 
     await milestoneDoc.save();
 
@@ -3308,51 +3596,14 @@ exports.submitDeliverable = async (req, res) => {
       milestoneHistoryId: String(milestoneHistory._id),
       deliverableId: String(deliverable._id),
       revisionId: updatedRevision?._id ? String(updatedRevision._id) : "",
-      deliverable: {
-        deliverableId: String(deliverable._id),
-        deliverableName: deliverable.deliverableName,
-        deliveries: deliverable.deliveries || [],
-        aspectRatio: deliverable.aspectRatio || "",
-        platforms: deliverable.platforms || [],
-        quantity: deliverable.quantity || 1,
-        deliverableLinks: (deliverable.deliverableLinks || []).map((item) => ({
-          linkId: String(item._id),
-          label: item.label || "",
-          url: item.url || "",
-        })),
-        status: deliverable.status,
-        submittedAt: deliverable.submittedAt,
-        comments: deliverable.comments || "",
-        approvedRole: deliverable.approvedRole || "",
-        approvalId: deliverable.approvalId || "",
-        approvedAt: deliverable.approvedAt || null,
-        revisionRequestedAt: deliverable.revisionRequestedAt || null,
-        revisions: (deliverable.revisions || []).map((revision) => ({
-          revisionId: String(revision._id),
-          deliverableId: String(revision.deliverableId || deliverable._id),
-          issueName: revision.issueName || "",
-          revisionType: revision.revisionType || "free",
-          revisionBudget: Number(revision.revisionBudget || 0),
-          deliveryName: revision.deliveryName || "",
-          issueDeliverableLink: revision.issueDeliverableLink || "",
-          notes: revision.notes || "",
-          attachments: revision.attachments || [],
-          submissionDate: revision.submissionDate || null,
-          status: revision.status || "pending",
-          submittedAt: revision.submittedAt || null,
-          raisedByRole: revision.raisedByRole || "Brand",
-          raisedAt: revision.raisedAt || null,
-          createdAt: revision.createdAt || null,
-          updatedAt: revision.updatedAt || null,
-        })),
-        updatedAt: deliverable.updatedAt,
-      },
+      canSubmitMilestone: canSubmitMilestoneHistory(milestoneHistory),
+      deliverable: mapDeliverableForResponse(deliverable, milestoneDoc, milestoneHistory),
     });
   } catch (err) {
     console.error("Error in submitDeliverable:", err);
 
-    
-    await saveErrorLog(req, err, err?.statusCode || err?.status || err?.statusCode || 500, "SUBMIT_DELIVERABLE_ERROR");return res.status(500).json({
+    await saveErrorLog(req, err, err?.statusCode || err?.status || err?.statusCode || 500, "SUBMIT_DELIVERABLE_ERROR");
+    return res.status(500).json({
       success: false,
       message: "Internal server error",
     });

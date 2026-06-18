@@ -39,6 +39,7 @@ const VerifyOtpModel = VerifyEmail;
 
 const ApplyCampaign = require("../models/applyCampaign");
 const Campaign = require("../models/campaign");
+const Contract = require("../models/contract");
 const { AgeRangeModel: AgeRange } = require("../models/ageRange");
 const Country = require("../models/country");
 const { ProductServiceGoalModel } = require("../models/productServiceGoal");
@@ -49,6 +50,7 @@ const { attachExternalEmailToInfluencer } = require("../utils/emailAliases");
 const { escapeRegExp } = require("../utils/searchTokens");
 const { buildOtpEmailTemplate } = require("../template/buildOtpEmailTemplate");
 const saveErrorLog = require("../services/errorLog.service");
+const { CONTRACT_STATUS } = require("../constants/contract");
 
 const UUIDv4Regex =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -2501,6 +2503,116 @@ exports.getLiteInfluencerByIdPost = async (req, res) => {
   }
 };
 
+
+
+const SIGNED_CONTRACT_STATUSES_FOR_INFLUENCER_DASHBOARD = [
+  CONTRACT_STATUS.CONTRACT_SIGNED,
+  CONTRACT_STATUS.MILESTONES_CREATED,
+  "locked",
+].filter(Boolean);
+
+const NON_LIVE_CONTRACT_STATUSES_FOR_INFLUENCER_DASHBOARD = [
+  CONTRACT_STATUS.REJECTED,
+  CONTRACT_STATUS.SUPERSEDED,
+].filter(Boolean);
+
+function buildLiveContractFilterForInfluencerDashboard(...clauses) {
+  return {
+    $and: [
+      ...clauses.filter(Boolean),
+      { isRejected: { $ne: 1 } },
+      { status: { $nin: NON_LIVE_CONTRACT_STATUSES_FOR_INFLUENCER_DASHBOARD } },
+      {
+        $or: [
+          { supersededBy: { $exists: false } },
+          { supersededBy: null },
+          { supersededBy: "" },
+        ],
+      },
+    ],
+  };
+}
+
+function getCampaignTimelineEndForInfluencerDashboard(campaign = {}) {
+  const raw = campaign.endAt || campaign.timeline?.endDate || campaign.timeline?.end || null;
+  if (!raw) return null;
+
+  const date = raw instanceof Date ? raw : new Date(raw);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+function isCampaignTimelineFinishedForInfluencerDashboard(campaign = {}) {
+  const end = getCampaignTimelineEndForInfluencerDashboard(campaign);
+  return Boolean(end && end.getTime() <= Date.now());
+}
+
+function buildContractByCampaignIdForInfluencerDashboard(contracts = []) {
+  const map = new Map();
+
+  for (const contract of contracts) {
+    const campaignId = String(contract.campaignId || "").trim();
+    if (!campaignId || map.has(campaignId)) continue;
+
+    map.set(campaignId, {
+      contractMongoId: contract._id ? String(contract._id) : "",
+      contractId: contract.contractId || String(contract._id || ""),
+      feeAmount: Number(contract.feeAmount || 0),
+      isAccepted: contract.isAccepted === 1 ? 1 : 0,
+      isAssigned: contract.isAssigned === 1 ? 1 : 0,
+      status: contract.status || null,
+      milestonesCreatedAt: contract.milestonesCreatedAt || null,
+      lockedAt: contract.lockedAt || null,
+      createdAt: contract.createdAt || null,
+    });
+  }
+
+  return map;
+}
+
+function getContractDetailsForInfluencerDashboard(map, campaign = {}) {
+  return (
+    map.get(String(campaign._id || "")) ||
+    map.get(String(campaign.campaignId || "")) ||
+    {}
+  );
+}
+
+function buildCampaignListStateForInfluencerDashboard(campaign = {}, contractDetails = {}) {
+  const signed = SIGNED_CONTRACT_STATUSES_FOR_INFLUENCER_DASHBOARD.includes(String(contractDetails.status || ""));
+  const timelineFinished = isCampaignTimelineFinishedForInfluencerDashboard(campaign);
+
+  if (signed && timelineFinished) {
+    return {
+      campaignListStatus: "completed",
+      campaignStatus: "completed",
+      status: "completed",
+      isActive: 0,
+      isContractSigned: 1,
+      isContracted: 1,
+    };
+  }
+
+  if (signed) {
+    return {
+      campaignListStatus: "active",
+      campaignStatus: "active",
+      status: "active",
+      isActive: 1,
+      isContractSigned: 1,
+      isContracted: 0,
+    };
+  }
+
+  return {
+    campaignListStatus: "applied",
+    campaignStatus: "applied",
+    status: campaign.status || "active",
+    isActive: campaign.isActive,
+    isContractSigned: 0,
+    isContracted: 0,
+  };
+}
+
 /* ============================== Campaigns ============================== */
 exports.getCampaignsByInfluencer = async (req, res) => {
   try {
@@ -2516,15 +2628,11 @@ exports.getCampaignsByInfluencer = async (req, res) => {
     const influencerMongoId = String(influencerId || "").trim();
 
     if (!influencerMongoId) {
-      return res.status(400).json({
-        message: "influencerId is required",
-      });
+      return res.status(400).json({ message: "influencerId is required" });
     }
 
     if (!mongoose.Types.ObjectId.isValid(influencerMongoId)) {
-      return res.status(400).json({
-        message: "Valid influencerId is required",
-      });
+      return res.status(400).json({ message: "Valid influencerId is required" });
     }
 
     const pageNum = Math.max(parseInt(page, 10) || 1, 1);
@@ -2549,74 +2657,90 @@ exports.getCampaignsByInfluencer = async (req, res) => {
 
     const influencer = await InfluencerModel.findById(
       influencerMongoId,
-      "_id name email"
+      "_id influencerId name email"
     ).lean();
 
     if (!influencer) {
-      return res.status(404).json({
-        message: "Influencer not found",
-      });
+      return res.status(404).json({ message: "Influencer not found" });
     }
 
     const internalInfluencerId = String(influencer._id);
+    const publicInfluencerId = String(influencer.influencerId || influencer._id);
     const influencerName = influencer.name || "";
 
-    const applyDocs = await ApplyCampaign.find({
-      $or: [
-        { "applicants.influencerId": internalInfluencerId },
-        { "approved.influencerId": internalInfluencerId },
-      ],
-    }).lean();
+    const possibleInfluencerIds = [internalInfluencerId, publicInfluencerId].filter(Boolean);
+    const possibleInfluencerObjectIds = possibleInfluencerIds
+      .filter((id) => mongoose.Types.ObjectId.isValid(id))
+      .map((id) => new mongoose.Types.ObjectId(id));
 
-    if (!applyDocs.length) {
+    const contractInfluencerClause = {
+      $or: [
+        { influencerId: { $in: possibleInfluencerIds } },
+        ...(possibleInfluencerObjectIds.length
+          ? [
+            { influencerId: { $in: possibleInfluencerObjectIds } },
+            { "influencer._id": { $in: possibleInfluencerObjectIds } },
+          ]
+          : []),
+        { "influencer.influencerId": { $in: possibleInfluencerIds } },
+      ],
+    };
+
+    const [applyDocs, contracts] = await Promise.all([
+      ApplyCampaign.find({
+        $or: [
+          { "applicants.influencerId": internalInfluencerId },
+          { "applicants.influencerId": publicInfluencerId },
+          { "approved.influencerId": internalInfluencerId },
+          { "approved.influencerId": publicInfluencerId },
+        ],
+      }).lean(),
+
+      Contract.find(
+        buildLiveContractFilterForInfluencerDashboard(contractInfluencerClause),
+        "campaignId contractId feeAmount isAccepted isAssigned status milestonesCreatedAt lockedAt lastActionAt createdAt"
+      )
+        .sort({ lastActionAt: -1, createdAt: -1 })
+        .lean(),
+    ]);
+
+    const contractByCampaignId = buildContractByCampaignIdForInfluencerDashboard(contracts);
+
+    const campaignIds = [
+      ...new Set([
+        ...applyDocs.map((doc) => String(doc.campaignId || "").trim()).filter(Boolean),
+        ...Array.from(contractByCampaignId.keys()),
+      ]),
+    ];
+
+    if (!campaignIds.length) {
       return res.status(200).json({
         total: 0,
         page: pageNum,
         pages: 0,
         influencer: {
           _id: internalInfluencerId,
-          influencerId: internalInfluencerId,
+          influencerId: publicInfluencerId,
           name: influencerName,
           email: influencer.email || "",
         },
         campaigns: [],
       });
     }
-
-    const campaignIds = [
-      ...new Set(
-        applyDocs
-          .map((doc) => String(doc.campaignId || "").trim())
-          .filter(Boolean)
-      ),
-    ];
 
     const campaignObjectIds = campaignIds
       .filter((campaignId) => mongoose.Types.ObjectId.isValid(campaignId))
       .map((campaignId) => new mongoose.Types.ObjectId(campaignId));
 
-    if (!campaignObjectIds.length) {
-      return res.status(200).json({
-        total: 0,
-        page: pageNum,
-        pages: 0,
-        influencer: {
-          _id: internalInfluencerId,
-          influencerId: internalInfluencerId,
-          name: influencerName,
-          email: influencer.email || "",
-        },
-        campaigns: [],
-      });
-    }
-
     const filter = {
-      _id: { $in: campaignObjectIds },
+      $or: [
+        ...(campaignObjectIds.length ? [{ _id: { $in: campaignObjectIds } }] : []),
+        { campaignId: { $in: campaignIds } },
+      ],
     };
 
     if (search && String(search).trim()) {
       const s = String(search).trim();
-
       filter.$and = [
         {
           $or: [
@@ -2684,15 +2808,10 @@ exports.getCampaignsByInfluencer = async (req, res) => {
           "";
 
       const brandMongoId = String(rawBrandId || "").trim();
-
-      return mongoose.Types.ObjectId.isValid(brandMongoId)
-        ? brandMongoId
-        : "";
+      return mongoose.Types.ObjectId.isValid(brandMongoId) ? brandMongoId : "";
     };
 
-    const brandMongoIds = [
-      ...new Set(campaigns.map(getBrandMongoId).filter(Boolean)),
-    ];
+    const brandMongoIds = [...new Set(campaigns.map(getBrandMongoId).filter(Boolean))];
 
     const [countries, ageRanges, campaignGoals, brands] = await Promise.all([
       allCountryIds.length
@@ -2707,73 +2826,49 @@ exports.getCampaignsByInfluencer = async (req, res) => {
         : Promise.resolve([]),
 
       allCampaignGoalIds.length
-        ? ProductServiceGoalModel.find(
-          { _id: { $in: allCampaignGoalIds } },
-          "_id goal"
-        ).lean()
+        ? ProductServiceGoalModel.find({ _id: { $in: allCampaignGoalIds } }, "_id goal").lean()
         : Promise.resolve([]),
 
       brandMongoIds.length
         ? Brand.find(
-          {
-            _id: {
-              $in: brandMongoIds.map(
-                (brandId) => new mongoose.Types.ObjectId(brandId)
-              ),
-            },
-          },
+          { _id: { $in: brandMongoIds.map((brandId) => new mongoose.Types.ObjectId(brandId)) } },
           "_id brandName name email proxyEmail website profilePic industry companySize companyDetails pocContact currencyFormat preferredLanguage region"
         ).lean()
         : Promise.resolve([]),
     ]);
 
     const getCountryName = (item = {}) =>
-      String(
-        item.countryNameEn ||
-        item.countryName ||
-        item.name ||
-        item.countryNameLocal ||
-        item.countryCode ||
-        ""
-      ).trim();
+      String(item.countryNameEn || item.countryName || item.name || item.countryNameLocal || item.countryCode || "").trim();
 
-    const countryMap = new Map(
-      countries.map((item) => [String(item._id), getCountryName(item)])
-    );
-
-    const ageRangeMap = new Map(
-      ageRanges.map((item) => [String(item._id), item.range || ""])
-    );
-
-    const campaignGoalMap = new Map(
-      campaignGoals.map((item) => [String(item._id), item.goal || ""])
-    );
-
-    const brandMap = new Map(
-      brands.map((brand) => [String(brand._id), brand])
-    );
+    const countryMap = new Map(countries.map((item) => [String(item._id), getCountryName(item)]));
+    const ageRangeMap = new Map(ageRanges.map((item) => [String(item._id), item.range || ""]));
+    const campaignGoalMap = new Map(campaignGoals.map((item) => [String(item._id), item.goal || ""]));
+    const brandMap = new Map(brands.map((brand) => [String(brand._id), brand]));
 
     const result = campaigns.map((campaign) => {
       const campaignId = String(campaign._id);
+      const campaignLegacyId = String(campaign.campaignId || "");
 
-      const related = applyDocs.find(
-        (doc) => String(doc.campaignId || "") === campaignId
+      const related = applyDocs.find((doc) =>
+        [campaignId, campaignLegacyId].includes(String(doc.campaignId || ""))
       );
 
-      const approvedApplicant = related?.approved?.find(
-        (item) => String(item.influencerId || "") === internalInfluencerId
+      const approvedApplicant = related?.approved?.find((item) =>
+        [internalInfluencerId, publicInfluencerId].includes(String(item.influencerId || ""))
       );
 
-      const applicant = related?.applicants?.find(
-        (item) => String(item.influencerId || "") === internalInfluencerId
+      const applicant = related?.applicants?.find((item) =>
+        [internalInfluencerId, publicInfluencerId].includes(String(item.influencerId || ""))
       );
 
-      let applicationStatus = "pending";
+      const contractDetails = getContractDetailsForInfluencerDashboard(contractByCampaignId, campaign);
+      const state = buildCampaignListStateForInfluencerDashboard(campaign, contractDetails);
 
-      if (approvedApplicant) {
-        applicationStatus = "approved";
-      } else if (applicant) {
-        applicationStatus = "applied";
+      let applicationStatus = state.campaignListStatus;
+      if (state.campaignListStatus === "applied") {
+        if (contractDetails.contractId) applicationStatus = "contract_in_progress";
+        else if (approvedApplicant) applicationStatus = "approved";
+        else if (applicant) applicationStatus = "applied";
       }
 
       const targetCountryIds = Array.isArray(campaign.targetCountryIds)
@@ -2788,48 +2883,21 @@ exports.getCampaignsByInfluencer = async (req, res) => {
         ? campaign.campaignGoals.map((goalId) => String(goalId))
         : [];
 
-      const targetCountryValues = targetCountryIds
-        .map((countryId) => countryMap.get(countryId))
-        .filter(Boolean);
-
-      const targetCountry =
-        targetCountryValues.length > 0
-          ? targetCountryValues.join(", ")
-          : campaign.targetCountry || "";
-
-      const targetAgeGroupValues = targetAgeRanges.map(
-        (ageRangeId) => ageRangeMap.get(ageRangeId) || ageRangeId
-      );
-
-      const campaignGoalValues = campaignGoalsIds.map(
-        (goalId) => campaignGoalMap.get(goalId) || goalId
-      );
+      const targetCountryValues = targetCountryIds.map((countryId) => countryMap.get(countryId)).filter(Boolean);
+      const targetCountry = targetCountryValues.length > 0 ? targetCountryValues.join(", ") : campaign.targetCountry || "";
+      const targetAgeGroupValues = targetAgeRanges.map((ageRangeId) => ageRangeMap.get(ageRangeId) || ageRangeId);
+      const campaignGoalValues = campaignGoalsIds.map((goalId) => campaignGoalMap.get(goalId) || goalId);
 
       const brandMongoId = getBrandMongoId(campaign);
       const brandDoc = brandMongoId ? brandMap.get(brandMongoId) : null;
 
-      const resolvedBrandId = brandDoc?._id
-        ? String(brandDoc._id)
-        : brandMongoId;
-
-      const resolvedBrandName =
-        brandDoc?.brandName ||
-        brandDoc?.name ||
-        campaign.brandName ||
-        "";
-
-      const resolvedBrandProfilePic =
-        brandDoc?.profilePic ||
-        campaign.brandProfilePic ||
-        campaign.brandprofilepic ||
-        campaign.brandLogoUrl ||
-        campaign.brandLogo ||
-        "";
+      const resolvedBrandId = brandDoc?._id ? String(brandDoc._id) : brandMongoId;
+      const resolvedBrandName = brandDoc?.brandName || brandDoc?.name || campaign.brandName || "";
+      const resolvedBrandProfilePic = brandDoc?.profilePic || campaign.brandProfilePic || campaign.brandprofilepic || campaign.brandLogoUrl || campaign.brandLogo || "";
 
       return {
         id: campaignId,
         campaignId,
-
         brandId: resolvedBrandId,
         brand: {
           _id: resolvedBrandId,
@@ -2852,14 +2920,13 @@ exports.getCampaignsByInfluencer = async (req, res) => {
         campaignName: campaign.campaignTitle || "",
         name: campaign.campaignTitle || "",
         campaignTitle: campaign.campaignTitle || "",
-
         brandName: resolvedBrandName,
         brandProfilePic: resolvedBrandProfilePic,
         brandLogoUrl: resolvedBrandProfilePic,
 
         influencer: {
           _id: internalInfluencerId,
-          influencerId: internalInfluencerId,
+          influencerId: publicInfluencerId,
           name: influencerName,
           email: influencer.email || "",
         },
@@ -2871,80 +2938,77 @@ exports.getCampaignsByInfluencer = async (req, res) => {
         categoryId: campaign.categoryId || null,
         subcategoryIds: campaign.subcategoryIds || [],
         categories: campaign.categories || [],
-
         productImages: campaign.productImages || [],
         images: campaign.productImages || [],
-
         productLink: campaign.productLink || "",
         videoLink: campaign.videoLink || "",
         productServiceInfo: campaign.productServiceInfo || [],
-
         campaignGoals: campaign.campaignGoals || [],
         campaignGoalValues,
-
         influencerTierIds: campaign.influencerTierIds || [],
         contentFormats: campaign.contentFormats || [],
         contentLanguageIds: campaign.contentLanguageIds || [],
         preferredHashtags: campaign.preferredHashtags || [],
-
         targetCountryIds: campaign.targetCountryIds || [],
         targetCountryValues,
         targetCountries: targetCountryValues,
         targetCountry,
-
         targetAgeRanges: campaign.targetAgeRanges || [],
         targetAgeGroupValues,
-
         numberOfInfluencers: campaign.numberOfInfluencers || 0,
         influencerTier: campaign.influencerTier || "",
         minFollowers: campaign.minFollowers || 0,
         maxFollowers: campaign.maxFollowers || 0,
-
         creatorContentLanguage: campaign.creatorContentLanguage || "",
         audienceContentLanguage: campaign.audienceContentLanguage || "",
-
         campaignBudget: campaign.campaignBudget || 0,
         budget: campaign.budget || campaign.campaignBudget || 0,
         influencerBudget: campaign.influencerBudget || 0,
         paymentType: campaign.paymentType || "Milestone",
-
         platformSelection: campaign.platformSelection || [],
         hashtags: campaign.hashtags || [],
         additionalNotes: campaign.additionalNotes || "",
         campaignTimezone: campaign.campaignTimezone || "UTC",
-
         startAt: campaign.startAt || null,
         endAt: campaign.endAt || null,
         publishedAt: campaign.publishedAt || null,
-        timeline: campaign.timeline || {},
-
+        timeline: {
+          startDate: campaign.startAt || campaign.timeline?.startDate || null,
+          endDate: campaign.endAt || campaign.timeline?.endDate || null,
+          ...(campaign.timeline || {}),
+        },
         createdLocation: campaign.createdLocation || null,
 
-        status: campaign.status || "draft",
+        status: state.status,
         applicationStatus,
+        campaignListStatus: state.campaignListStatus,
+        campaignStatus: state.campaignStatus,
         publishStatus: campaign.publishStatus || "draft",
         approvalMode: campaign.approvalMode || "direct",
-
-        isActive: campaign.isActive,
+        isActive: state.isActive,
         isDraft: campaign.isDraft,
         byAi: campaign.byAi,
-
         applicantCount: campaign.applicantCount || 0,
-        hasApplied: applicant || approvedApplicant ? 1 : 0,
-        hasApproved: approvedApplicant ? 1 : 0,
-
+        hasApplied: applicant || approvedApplicant || contractDetails.contractId ? 1 : 0,
+        hasApproved: approvedApplicant || contractDetails.contractId ? 1 : 0,
+        isApproved: approvedApplicant || contractDetails.contractId ? 1 : 0,
+        isContractSigned: state.isContractSigned,
+        isContracted: state.isContracted,
+        isAccepted: contractDetails.isAccepted || 0,
+        contractId: contractDetails.contractId || null,
+        contractMongoId: contractDetails.contractMongoId || null,
+        contractStatus: contractDetails.status || null,
+        feeAmount: contractDetails.feeAmount || 0,
         pendingUpdate: campaign.pendingUpdate || { status: "none" },
-
         createdBy: campaign.createdBy || null,
-
         appliedDate:
           applicant?.appliedAt ||
           applicant?.createdAt ||
           approvedApplicant?.approvedAt ||
           approvedApplicant?.createdAt ||
           related?.createdAt ||
+          contractDetails.createdAt ||
           campaign.createdAt,
-
         createdAt: campaign.createdAt,
         updatedAt: campaign.updatedAt,
       };
@@ -2956,7 +3020,7 @@ exports.getCampaignsByInfluencer = async (req, res) => {
       pages: Math.ceil(total / limitNum),
       influencer: {
         _id: internalInfluencerId,
-        influencerId: internalInfluencerId,
+        influencerId: publicInfluencerId,
         name: influencerName,
         email: influencer.email || "",
       },
@@ -2972,9 +3036,7 @@ exports.getCampaignsByInfluencer = async (req, res) => {
 
     console.error("Error in getCampaignsByInfluencer:", error);
 
-    return res.status(500).json({
-      message: "Internal server error",
-    });
+    return res.status(500).json({ message: "Internal server error" });
   }
 };
 

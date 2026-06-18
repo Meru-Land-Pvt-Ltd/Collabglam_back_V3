@@ -25,148 +25,252 @@ const toNumber = (v, def = 0) => {
 
 const roundMoney = (value) => Math.round((Number(value) || 0) * 100) / 100;
 
-const calcAllocationTotal = (allocations = []) =>
-  allocations.reduce((sum, item) => sum + (Number(item.amount) || 0), 0);
-
-const calcReleasedTotal = (allocations = []) =>
-  allocations.reduce((sum, item) => sum + (Number(item.releasedAmount) || 0), 0);
-
-const syncCampaignFreeze = (freeze) => {
-  if (!freeze) return null;
-
-  freeze.influencerAllocations = Array.isArray(freeze.influencerAllocations)
-    ? freeze.influencerAllocations
-    : [];
-
-  freeze.influencerAllocations.forEach((allocation) => {
-    allocation.amount = roundMoney(allocation.amount);
-    allocation.releasedAmount = roundMoney(allocation.releasedAmount);
-
-    allocation.pendingAmount = Math.max(
-      0,
-      roundMoney(
-        Number(allocation.amount || 0) - Number(allocation.releasedAmount || 0)
-      )
-    );
-
-    if (allocation.pendingAmount <= 0 && allocation.amount > 0) {
-      allocation.status = "released";
-    } else if (allocation.releasedAmount > 0) {
-      allocation.status = "partially_released";
-    } else {
-      allocation.status = "allocated";
-    }
-  });
-
-  const totalFrozenAmount = roundMoney(freeze.totalFrozenAmount);
-  const totalAllocatedAmount = roundMoney(
-    calcAllocationTotal(freeze.influencerAllocations)
-  );
-  const totalReleasedAmount = roundMoney(
-    calcReleasedTotal(freeze.influencerAllocations)
-  );
-
-  freeze.totalFrozenAmount = totalFrozenAmount;
-  freeze.totalAllocatedAmount = totalAllocatedAmount;
-  freeze.totalReleasedAmount = totalReleasedAmount;
-
-  freeze.currentFrozenAmount = Math.max(
-    0,
-    roundMoney(totalFrozenAmount - totalReleasedAmount)
-  );
-
-  freeze.availableToAllocate = Math.max(
-    0,
-    roundMoney(totalFrozenAmount - totalAllocatedAmount)
-  );
-
-  if (freeze.currentFrozenAmount <= 0 && totalFrozenAmount > 0) {
-    freeze.status = "released";
-  } else if (freeze.availableToAllocate <= 0 && totalFrozenAmount > 0) {
-    freeze.status = "fully_allocated";
-  } else {
-    freeze.status = "active";
-  }
-
-  freeze.updatedAt = new Date();
-
-  return freeze;
-};
-
-const calcFrozenAll = (freezes = []) =>
-  roundMoney(
-    freezes.reduce((sum, freeze) => {
-      syncCampaignFreeze(freeze);
-      return sum + (Number(freeze.currentFrozenAmount) || 0);
-    }, 0)
-  );
-
 const syncWalletBalances = (wallet) => {
-  wallet.freezes = Array.isArray(wallet.freezes) ? wallet.freezes : [];
-  wallet.freezes.forEach(syncCampaignFreeze);
+  wallet.walletBalance = Math.max(0, roundMoney(wallet.walletBalance));
+  wallet.escrowBalance = Math.max(
+    0,
+    roundMoney(wallet.escrowBalance ?? wallet.frozenBalance ?? 0)
+  );
 
-  wallet.walletBalance = roundMoney(wallet.walletBalance);
-  wallet.frozenBalance = calcFrozenAll(wallet.freezes);
+  // Keep this old field as an alias so existing UI/API consumers keep working.
+  wallet.frozenBalance = wallet.escrowBalance;
+
+  // Old frontend code sometimes reads usableBalance. In the single-wallet model,
+  // usableBalance equals walletBalance because escrow has already been moved out.
+  wallet.usableBalance = wallet.walletBalance;
 
   return {
     walletBalance: wallet.walletBalance,
+    escrowBalance: wallet.escrowBalance,
     frozenBalance: wallet.frozenBalance,
+    usableBalance: wallet.usableBalance,
   };
 };
 
-const ensureCampaignFreeze = (wallet, brandId, campaignId) => {
-  wallet.freezes = Array.isArray(wallet.freezes) ? wallet.freezes : [];
+const getOrCreateWallet = async (brandId, session = null) => {
+  let query = BrandWalletModel.findOne({ brandId });
+  if (session) query = query.session(session);
 
-  let freezeIndex = wallet.freezes.findIndex(
-    (f) =>
-      String(f.brandId) === String(brandId) &&
-      String(f.campaignId) === String(campaignId)
-  );
-
-  if (freezeIndex === -1) {
-    wallet.freezes.push({
-      brandId,
-      campaignId,
-      totalFrozenAmount: 0,
-      currentFrozenAmount: 0,
-      availableToAllocate: 0,
-      totalAllocatedAmount: 0,
-      totalReleasedAmount: 0,
-      status: "active",
-      influencerAllocations: [],
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    });
-
-    freezeIndex = wallet.freezes.length - 1;
-  }
-
-  const campaignFreeze = wallet.freezes[freezeIndex];
-  syncCampaignFreeze(campaignFreeze);
-
-  return campaignFreeze;
-};
-
-const getOrCreateWallet = async (brandId) => {
-  let wallet = await BrandWalletModel.findOne({ brandId });
+  let wallet = await query;
 
   if (!wallet) {
-    wallet = await BrandWalletModel.create({
+    wallet = new BrandWalletModel({
       brandId,
       walletBalance: 0,
+      escrowBalance: 0,
       frozenBalance: 0,
-      freezes: [],
       topups: [],
+      escrowHistories: [],
+      withdrawHistories: [],
+      freezes: [],
       freezeHistories: [],
       allocationHistories: [],
-      withdrawHistories: [],
     });
   }
 
   syncWalletBalances(wallet);
-  await wallet.save();
+
+  if (session) {
+    await wallet.save({ session });
+  } else {
+    await wallet.save();
+  }
 
   return wallet;
+};
+
+const pushEscrowHistory = (wallet, payload = {}) => {
+  wallet.escrowHistories = Array.isArray(wallet.escrowHistories)
+    ? wallet.escrowHistories
+    : [];
+
+  wallet.escrowHistories.push({
+    brandId: clean(payload.brandId || wallet.brandId),
+    type: clean(payload.type || "milestone_escrow"),
+    amount: roundMoney(payload.amount),
+    currency: clean(payload.currency || "usd").toLowerCase(),
+    campaignId: clean(payload.campaignId),
+    influencerId: clean(payload.influencerId),
+    contractId: clean(payload.contractId),
+    milestoneId: clean(payload.milestoneId),
+    milestoneHistoryId: clean(payload.milestoneHistoryId),
+    milestoneTitle: clean(payload.milestoneTitle),
+    walletBalanceBefore: roundMoney(payload.walletBalanceBefore),
+    walletBalanceAfter: roundMoney(payload.walletBalanceAfter),
+    escrowBalanceBefore: roundMoney(payload.escrowBalanceBefore),
+    escrowBalanceAfter: roundMoney(payload.escrowBalanceAfter),
+    note: clean(payload.note),
+    createdAt: new Date(),
+  });
+
+  wallet.markModified("escrowHistories");
+};
+
+const moveAmountToEscrow = (wallet, {
+  amount,
+  type = "milestone_escrow",
+  currency = "usd",
+  campaignId = "",
+  influencerId = "",
+  contractId = "",
+  milestoneId = "",
+  milestoneHistoryId = "",
+  milestoneTitle = "",
+  note = "",
+} = {}) => {
+  const amountNum = roundMoney(amount);
+  const before = syncWalletBalances(wallet);
+
+  if (!amountNum || amountNum <= 0) {
+    const err = new Error("amount must be > 0");
+    err.status = 400;
+    throw err;
+  }
+
+  if (before.walletBalance < amountNum) {
+    const err = new Error("Insufficient brand wallet balance. Please top up the remaining amount.");
+    err.status = 402;
+    err.extra = {
+      walletBalance: before.walletBalance,
+      escrowBalance: before.escrowBalance,
+      frozenBalance: before.frozenBalance,
+      usableBalance: before.usableBalance,
+      requiredAmount: amountNum,
+      needToAdd: roundMoney(amountNum - before.walletBalance),
+    };
+    throw err;
+  }
+
+  wallet.walletBalance = roundMoney(before.walletBalance - amountNum);
+  wallet.escrowBalance = roundMoney(before.escrowBalance + amountNum);
+  wallet.frozenBalance = wallet.escrowBalance;
+  wallet.usableBalance = wallet.walletBalance;
+
+  const after = syncWalletBalances(wallet);
+
+  pushEscrowHistory(wallet, {
+    brandId: wallet.brandId,
+    type,
+    amount: amountNum,
+    currency,
+    campaignId,
+    influencerId,
+    contractId,
+    milestoneId,
+    milestoneHistoryId,
+    milestoneTitle,
+    walletBalanceBefore: before.walletBalance,
+    walletBalanceAfter: after.walletBalance,
+    escrowBalanceBefore: before.escrowBalance,
+    escrowBalanceAfter: after.escrowBalance,
+    note,
+  });
+
+  return after;
+};
+
+const refundAmountFromEscrow = (wallet, {
+  amount,
+  type = "milestone_escrow_refund",
+  currency = "usd",
+  campaignId = "",
+  influencerId = "",
+  contractId = "",
+  milestoneId = "",
+  milestoneHistoryId = "",
+  milestoneTitle = "",
+  note = "",
+} = {}) => {
+  const amountNum = roundMoney(amount);
+  const before = syncWalletBalances(wallet);
+  const refundAmount = Math.min(amountNum, before.escrowBalance);
+
+  if (!refundAmount || refundAmount <= 0) return before;
+
+  wallet.walletBalance = roundMoney(before.walletBalance + refundAmount);
+  wallet.escrowBalance = roundMoney(before.escrowBalance - refundAmount);
+  wallet.frozenBalance = wallet.escrowBalance;
+  wallet.usableBalance = wallet.walletBalance;
+
+  const after = syncWalletBalances(wallet);
+
+  pushEscrowHistory(wallet, {
+    brandId: wallet.brandId,
+    type,
+    amount: refundAmount,
+    currency,
+    campaignId,
+    influencerId,
+    contractId,
+    milestoneId,
+    milestoneHistoryId,
+    milestoneTitle,
+    walletBalanceBefore: before.walletBalance,
+    walletBalanceAfter: after.walletBalance,
+    escrowBalanceBefore: before.escrowBalance,
+    escrowBalanceAfter: after.escrowBalance,
+    note,
+  });
+
+  return after;
+};
+
+const releaseAmountFromEscrow = (wallet, {
+  amount,
+  currency = "usd",
+  campaignId = "",
+  influencerId = "",
+  contractId = "",
+  milestoneId = "",
+  milestoneHistoryId = "",
+  milestoneTitle = "",
+  note = "",
+} = {}) => {
+  const amountNum = roundMoney(amount);
+  const before = syncWalletBalances(wallet);
+
+  if (!amountNum || amountNum <= 0) {
+    const err = new Error("amount must be > 0");
+    err.status = 400;
+    throw err;
+  }
+
+  if (before.escrowBalance < amountNum) {
+    const err = new Error("Escrow balance is less than milestone amount.");
+    err.status = 400;
+    err.extra = {
+      escrowBalance: before.escrowBalance,
+      frozenBalance: before.frozenBalance,
+      releaseAmount: amountNum,
+    };
+    throw err;
+  }
+
+  wallet.escrowBalance = roundMoney(before.escrowBalance - amountNum);
+  wallet.frozenBalance = wallet.escrowBalance;
+  wallet.usableBalance = wallet.walletBalance;
+
+  const after = syncWalletBalances(wallet);
+
+  pushEscrowHistory(wallet, {
+    brandId: wallet.brandId,
+    type: "milestone_release",
+    amount: amountNum,
+    currency,
+    campaignId,
+    influencerId,
+    contractId,
+    milestoneId,
+    milestoneHistoryId,
+    milestoneTitle,
+    walletBalanceBefore: before.walletBalance,
+    walletBalanceAfter: after.walletBalance,
+    escrowBalanceBefore: before.escrowBalance,
+    escrowBalanceAfter: after.escrowBalance,
+    note,
+  });
+
+  return after;
 };
 
 let stripeClient = null;
@@ -213,8 +317,11 @@ const getBrandWallet = async (req, res) => {
         {
           brandId,
           walletBalance: 0,
+          escrowBalance: 0,
           frozenBalance: 0,
-          freezes: [],
+          usableBalance: 0,
+          topups: [],
+          escrowHistories: [],
         },
         requestId
       );
@@ -228,9 +335,10 @@ const getBrandWallet = async (req, res) => {
       HttpStatus.OK,
       {
         brandId,
-        walletBalance: snap.walletBalance,
-        frozenBalance: snap.frozenBalance,
-        freezes: wallet.freezes || [],
+        ...snap,
+        topups: wallet.topups || [],
+        escrowHistories: wallet.escrowHistories || [],
+        withdrawHistories: wallet.withdrawHistories || [],
       },
       requestId
     );
@@ -251,7 +359,7 @@ const getBrandWallet = async (req, res) => {
 // ======================================================================
 // POST /brand-wallet/topup
 // body: { brandId, amount, currency, successUrl, cancelUrl }
-// Creates Stripe Checkout Session
+// Creates Stripe Checkout Session to add available walletBalance.
 // ======================================================================
 const topupBrandWallet = async (req, res) => {
   const requestId = getRequestId(req);
@@ -316,6 +424,7 @@ const topupBrandWallet = async (req, res) => {
         },
       ],
       metadata: {
+        kind: "brand_wallet_topup",
         brandId,
         amount: String(amount),
         currency,
@@ -352,7 +461,7 @@ const topupBrandWallet = async (req, res) => {
 // ======================================================================
 // POST /brand-wallet/topup/confirm
 // body: { brandId, sessionId }
-// Verifies Stripe payment and credits available walletBalance
+// Verifies Stripe payment and credits available walletBalance only.
 // ======================================================================
 const confirmBrandWalletTopup = async (req, res) => {
   const requestId = getRequestId(req);
@@ -381,13 +490,23 @@ const confirmBrandWalletTopup = async (req, res) => {
       );
     }
 
+    if (sessionId === "{CHECKOUT_SESSION_ID}") {
+      return ApiResponse.sendFail(
+        res,
+        HttpStatus.BAD_REQUEST,
+        EC("VALIDATION_ERROR"),
+        "Invalid Stripe sessionId placeholder received. The successUrl must keep {CHECKOUT_SESSION_ID} unencoded.",
+        requestId
+      );
+    }
+
     const stripe = getStripeClient();
 
-    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+    const stripeSession = await stripe.checkout.sessions.retrieve(sessionId, {
       expand: ["payment_intent"],
     });
 
-    if (!session) {
+    if (!stripeSession) {
       return ApiResponse.sendFail(
         res,
         HttpStatus.NOT_FOUND,
@@ -397,7 +516,7 @@ const confirmBrandWalletTopup = async (req, res) => {
       );
     }
 
-    if (clean(session.metadata?.brandId) !== brandId) {
+    if (clean(stripeSession.metadata?.brandId) !== brandId) {
       return ApiResponse.sendFail(
         res,
         HttpStatus.BAD_REQUEST,
@@ -407,7 +526,7 @@ const confirmBrandWalletTopup = async (req, res) => {
       );
     }
 
-    if (session.payment_status !== "paid") {
+    if (stripeSession.payment_status !== "paid") {
       return ApiResponse.sendFail(
         res,
         HttpStatus.BAD_REQUEST,
@@ -417,8 +536,8 @@ const confirmBrandWalletTopup = async (req, res) => {
       );
     }
 
-    const amount = roundMoney(toNumber(session.amount_total, 0) / 100);
-    const currency = clean(session.currency || "usd").toLowerCase();
+    const amount = roundMoney(toNumber(stripeSession.amount_total, 0) / 100);
+    const currency = clean(stripeSession.currency || "usd").toLowerCase();
 
     if (!amount || amount <= 0) {
       return ApiResponse.sendFail(
@@ -436,7 +555,7 @@ const confirmBrandWalletTopup = async (req, res) => {
 
     const alreadyCredited = wallet.topups.some(
       (t) =>
-        clean(t?.stripeSessionId) === session.id &&
+        clean(t?.stripeSessionId) === stripeSession.id &&
         clean(t?.status).toLowerCase() === "success"
     );
 
@@ -451,11 +570,11 @@ const confirmBrandWalletTopup = async (req, res) => {
         currency,
         status: "success",
         source: "stripe",
-        stripeSessionId: session.id,
+        stripeSessionId: stripeSession.id,
         stripePaymentIntentId:
-          typeof session.payment_intent === "string"
-            ? session.payment_intent
-            : session.payment_intent?.id || "",
+          typeof stripeSession.payment_intent === "string"
+            ? stripeSession.payment_intent
+            : stripeSession.payment_intent?.id || "",
         walletBalanceBefore,
         walletBalanceAfter,
         createdAt: new Date(),
@@ -464,7 +583,7 @@ const confirmBrandWalletTopup = async (req, res) => {
       wallet.markModified("topups");
     }
 
-    syncWalletBalances(wallet);
+    const snap = syncWalletBalances(wallet);
     await wallet.save();
 
     return ApiResponse.sendOk(
@@ -476,8 +595,7 @@ const confirmBrandWalletTopup = async (req, res) => {
           : "Wallet topped up successfully",
         brandId,
         addedAmount: amount,
-        walletBalance: wallet.walletBalance,
-        frozenBalance: wallet.frozenBalance,
+        ...snap,
       },
       requestId
     );
@@ -497,17 +615,17 @@ const confirmBrandWalletTopup = async (req, res) => {
 
 // ======================================================================
 // POST /brand-wallet/freeze-campaign
-// body: { brandId, campaignId, amount, note? }
-// Deducts amount from walletBalance and moves it to frozenBalance
+// Backward-compatible route: no campaign wallet exists anymore.
+// Moves amount from brand walletBalance into brand escrowBalance.
+// body: { brandId, amount, note?, campaignId?, influencerId? }
 // ======================================================================
 const freezeAmountForCampaign = async (req, res) => {
   const requestId = getRequestId(req);
 
   try {
     const brandId = clean(req.body.brandId);
-    const campaignId = clean(req.body.campaignId);
     const amount = roundMoney(Math.max(0, toNumber(req.body.amount, 0)));
-    const note = clean(req.body.note);
+    const note = clean(req.body.note || "Manual escrow move");
 
     if (!brandId) {
       return ApiResponse.sendFail(
@@ -519,79 +637,27 @@ const freezeAmountForCampaign = async (req, res) => {
       );
     }
 
-    if (!campaignId) {
-      return ApiResponse.sendFail(
-        res,
-        HttpStatus.BAD_REQUEST,
-        EC("VALIDATION_ERROR"),
-        "campaignId is required",
-        requestId
-      );
-    }
-
-    if (!amount || amount <= 0) {
-      return ApiResponse.sendFail(
-        res,
-        HttpStatus.BAD_REQUEST,
-        EC("VALIDATION_ERROR"),
-        "amount must be > 0",
-        requestId
-      );
-    }
-
     const wallet = await getOrCreateWallet(brandId);
 
-    syncWalletBalances(wallet);
-
-    if (amount > Number(wallet.walletBalance || 0)) {
+    let snap;
+    try {
+      snap = moveAmountToEscrow(wallet, {
+        amount,
+        type: "manual_escrow",
+        campaignId: req.body.campaignId,
+        influencerId: req.body.influencerId,
+        note,
+      });
+    } catch (err) {
       return ApiResponse.sendFail(
         res,
-        HttpStatus.BAD_REQUEST,
-        EC("INSUFFICIENT_WALLET_BALANCE"),
-        "Freeze amount cannot be greater than walletBalance",
-        requestId
+        err.status || HttpStatus.BAD_REQUEST,
+        err.status === 402 ? EC("INSUFFICIENT_WALLET_BALANCE") : EC("VALIDATION_ERROR"),
+        err.message,
+        requestId,
+        err.extra || {}
       );
     }
-
-    const walletBalanceBefore = roundMoney(wallet.walletBalance);
-    const walletBalanceAfter = roundMoney(walletBalanceBefore - amount);
-
-    const frozenBalanceBefore = roundMoney(wallet.frozenBalance);
-
-    const campaignFreeze = ensureCampaignFreeze(wallet, brandId, campaignId);
-
-    const campaignFrozenBefore = roundMoney(campaignFreeze.totalFrozenAmount);
-    const campaignFrozenAfter = roundMoney(campaignFrozenBefore + amount);
-
-    wallet.walletBalance = walletBalanceAfter;
-
-    campaignFreeze.totalFrozenAmount = campaignFrozenAfter;
-
-    syncCampaignFreeze(campaignFreeze);
-    syncWalletBalances(wallet);
-
-    const frozenBalanceAfter = roundMoney(wallet.frozenBalance);
-
-    wallet.freezeHistories = Array.isArray(wallet.freezeHistories)
-      ? wallet.freezeHistories
-      : [];
-
-    wallet.freezeHistories.push({
-      brandId,
-      campaignId,
-      amount,
-      walletBalanceBefore,
-      walletBalanceAfter,
-      frozenBalanceBefore,
-      frozenBalanceAfter,
-      campaignFrozenBefore,
-      campaignFrozenAfter,
-      note,
-      createdAt: new Date(),
-    });
-
-    wallet.markModified("freezes");
-    wallet.markModified("freezeHistories");
 
     await wallet.save();
 
@@ -599,18 +665,15 @@ const freezeAmountForCampaign = async (req, res) => {
       res,
       HttpStatus.OK,
       {
-        message: "Amount frozen for campaign successfully",
+        message: "Amount moved to escrow successfully",
         brandId,
-        campaignId,
-        frozenAmount: amount,
-        walletBalance: wallet.walletBalance,
-        frozenBalance: wallet.frozenBalance,
-        campaignFreeze,
+        escrowAmount: amount,
+        ...snap,
       },
       requestId
     );
   } catch (err) {
-    await saveErrorLog(req, err, 500, "FREEZE_AMOUNT_FOR_CAMPAIGN_ERROR");
+    await saveErrorLog(req, err, 500, "MOVE_AMOUNT_TO_ESCROW_ERROR");
     const message = err instanceof Error ? err.message : "Internal error";
 
     return ApiResponse.sendFail(
@@ -625,210 +688,17 @@ const freezeAmountForCampaign = async (req, res) => {
 
 // ======================================================================
 // POST /brand-wallet/allocate-to-influencer
-// body: { brandId, campaignId, influencerId, amount?, note? }
-// If amount is not passed, allocates all availableToAllocate to influencer
+// Backward-compatible route. Allocation is no longer campaign-scoped;
+// use this only as another way to move available balance to escrow.
 // ======================================================================
 const allocateToInfluencer = async (req, res) => {
-  const requestId = getRequestId(req);
-
-  try {
-    const brandId = clean(req.body.brandId);
-    const campaignId = clean(req.body.campaignId);
-    const influencerId = clean(req.body.influencerId);
-    const requestedAmount = roundMoney(toNumber(req.body.amount, 0));
-    const note = clean(req.body.note);
-
-    if (!brandId) {
-      return ApiResponse.sendFail(
-        res,
-        HttpStatus.BAD_REQUEST,
-        EC("VALIDATION_ERROR"),
-        "Valid brandId is required",
-        requestId
-      );
-    }
-
-    if (!campaignId) {
-      return ApiResponse.sendFail(
-        res,
-        HttpStatus.BAD_REQUEST,
-        EC("VALIDATION_ERROR"),
-        "campaignId is required",
-        requestId
-      );
-    }
-
-    if (!influencerId) {
-      return ApiResponse.sendFail(
-        res,
-        HttpStatus.BAD_REQUEST,
-        EC("VALIDATION_ERROR"),
-        "influencerId is required",
-        requestId
-      );
-    }
-
-    const wallet = await BrandWalletModel.findOne({ brandId });
-
-    if (!wallet) {
-      return ApiResponse.sendFail(
-        res,
-        HttpStatus.NOT_FOUND,
-        EC("NOT_FOUND"),
-        "Brand wallet not found",
-        requestId
-      );
-    }
-
-    const campaignFreeze = (wallet.freezes || []).find(
-      (freeze) =>
-        String(freeze.brandId) === String(brandId) &&
-        String(freeze.campaignId) === String(campaignId)
-    );
-
-    if (!campaignFreeze) {
-      return ApiResponse.sendFail(
-        res,
-        HttpStatus.NOT_FOUND,
-        EC("NOT_FOUND"),
-        "No frozen amount found for this campaign",
-        requestId
-      );
-    }
-
-    syncCampaignFreeze(campaignFreeze);
-
-    const availableToAllocateBefore = roundMoney(
-      campaignFreeze.availableToAllocate
-    );
-
-    const amount =
-      requestedAmount && requestedAmount > 0
-        ? requestedAmount
-        : availableToAllocateBefore;
-
-    if (!amount || amount <= 0) {
-      return ApiResponse.sendFail(
-        res,
-        HttpStatus.BAD_REQUEST,
-        EC("VALIDATION_ERROR"),
-        "No amount available to allocate",
-        requestId
-      );
-    }
-
-    if (amount > availableToAllocateBefore) {
-      return ApiResponse.sendFail(
-        res,
-        HttpStatus.BAD_REQUEST,
-        EC("INSUFFICIENT_CAMPAIGN_FREEZE_BALANCE"),
-        "Allocation amount cannot be greater than campaign available frozen amount",
-        requestId
-      );
-    }
-
-    campaignFreeze.influencerAllocations = Array.isArray(
-      campaignFreeze.influencerAllocations
-    )
-      ? campaignFreeze.influencerAllocations
-      : [];
-
-    let allocation = campaignFreeze.influencerAllocations.find(
-      (item) => String(item.influencerId) === String(influencerId)
-    );
-
-    if (!allocation) {
-      campaignFreeze.influencerAllocations.push({
-        influencerId,
-        amount: 0,
-        releasedAmount: 0,
-        pendingAmount: 0,
-        status: "allocated",
-        allocatedAt: new Date(),
-        lastAllocatedAt: new Date(),
-      });
-
-      allocation =
-        campaignFreeze.influencerAllocations[
-          campaignFreeze.influencerAllocations.length - 1
-        ];
-    }
-
-    const influencerAllocatedBefore = roundMoney(allocation.amount);
-    const influencerAllocatedAfter = roundMoney(
-      influencerAllocatedBefore + amount
-    );
-
-    allocation.amount = influencerAllocatedAfter;
-    allocation.pendingAmount = roundMoney(
-      Number(allocation.amount || 0) - Number(allocation.releasedAmount || 0)
-    );
-    allocation.lastAllocatedAt = new Date();
-
-    syncCampaignFreeze(campaignFreeze);
-
-    const availableToAllocateAfter = roundMoney(
-      campaignFreeze.availableToAllocate
-    );
-
-    wallet.allocationHistories = Array.isArray(wallet.allocationHistories)
-      ? wallet.allocationHistories
-      : [];
-
-    wallet.allocationHistories.push({
-      brandId,
-      campaignId,
-      influencerId,
-      amount,
-      availableToAllocateBefore,
-      availableToAllocateAfter,
-      influencerAllocatedBefore,
-      influencerAllocatedAfter,
-      note,
-      createdAt: new Date(),
-    });
-
-    wallet.markModified("freezes");
-    wallet.markModified("allocationHistories");
-
-    syncWalletBalances(wallet);
-
-    await wallet.save();
-
-    return ApiResponse.sendOk(
-      res,
-      HttpStatus.OK,
-      {
-        message: "Amount allocated to influencer successfully",
-        brandId,
-        campaignId,
-        influencerId,
-        allocatedAmount: amount,
-        walletBalance: wallet.walletBalance,
-        frozenBalance: wallet.frozenBalance,
-        campaignFreeze,
-        influencerAllocation: allocation,
-      },
-      requestId
-    );
-  } catch (err) {
-    await saveErrorLog(req, err, 500, "ALLOCATE_TO_INFLUENCER_ERROR");
-    const message = err instanceof Error ? err.message : "Internal error";
-
-    return ApiResponse.sendFail(
-      res,
-      HttpStatus.INTERNAL_SERVER_ERROR,
-      EC("INTERNAL_ERROR"),
-      message,
-      requestId
-    );
-  }
+  return freezeAmountForCampaign(req, res);
 };
 
 // ======================================================================
 // POST /brand-wallet/withdraw
 // body: { brandId, amount, currency?, method?, transactionId?, note? }
-// Withdraws from walletBalance only
+// Withdraws from available walletBalance only. Escrow cannot be withdrawn.
 // ======================================================================
 const withdrawBrandWalletAmount = async (req, res) => {
   const requestId = getRequestId(req);
@@ -873,15 +743,21 @@ const withdrawBrandWalletAmount = async (req, res) => {
       );
     }
 
-    syncWalletBalances(wallet);
+    const before = syncWalletBalances(wallet);
 
-    if (amount > Number(wallet.walletBalance || 0)) {
+    if (amount > Number(before.walletBalance || 0)) {
       return ApiResponse.sendFail(
         res,
         HttpStatus.BAD_REQUEST,
         EC("INSUFFICIENT_WALLET_BALANCE"),
         "Withdraw amount cannot be greater than walletBalance",
-        requestId
+        requestId,
+        {
+          walletBalance: before.walletBalance,
+          escrowBalance: before.escrowBalance,
+          frozenBalance: before.frozenBalance,
+          needToAdd: roundMoney(amount - before.walletBalance),
+        }
       );
     }
 
@@ -909,7 +785,7 @@ const withdrawBrandWalletAmount = async (req, res) => {
 
     wallet.markModified("withdrawHistories");
 
-    syncWalletBalances(wallet);
+    const snap = syncWalletBalances(wallet);
 
     await wallet.save();
 
@@ -920,8 +796,7 @@ const withdrawBrandWalletAmount = async (req, res) => {
         message: "Wallet amount withdrawn successfully",
         brandId,
         withdrawnAmount: amount,
-        walletBalance: wallet.walletBalance,
-        frozenBalance: wallet.frozenBalance,
+        ...snap,
       },
       requestId
     );
@@ -940,7 +815,8 @@ const withdrawBrandWalletAmount = async (req, res) => {
 };
 
 // ======================================================================
-// GET /brand-wallet/freeze-amount?brandId=xxx&campaignId=xxx&influencerId=xxx
+// GET /brand-wallet/freeze-amount?brandId=xxx
+// Backward-compatible name. Returns global escrow summary.
 // ======================================================================
 const getFrozenAmountForCampaign = async (req, res) => {
   const requestId = getRequestId(req);
@@ -949,19 +825,13 @@ const getFrozenAmountForCampaign = async (req, res) => {
     const brandId = clean(
       typeof req.query.brandId === "string" ? req.query.brandId : ""
     );
-    const campaignId = clean(
-      typeof req.query.campaignId === "string" ? req.query.campaignId : ""
-    );
-    const influencerId = clean(
-      typeof req.query.influencerId === "string" ? req.query.influencerId : ""
-    );
 
-    if (!brandId || !campaignId) {
+    if (!brandId) {
       return ApiResponse.sendFail(
         res,
         HttpStatus.BAD_REQUEST,
         EC("VALIDATION_ERROR"),
-        "brandId and campaignId are required",
+        "brandId is required",
         requestId
       );
     }
@@ -974,106 +844,35 @@ const getFrozenAmountForCampaign = async (req, res) => {
         HttpStatus.OK,
         {
           brandId,
-          campaignId,
           walletBalance: 0,
+          escrowBalance: 0,
           frozenBalance: 0,
+          usableBalance: 0,
           totalFrozenAmount: 0,
           currentFrozenAmount: 0,
-          totalAllocatedAmount: 0,
-          totalReleasedAmount: 0,
           availableToAllocate: 0,
-          influencer: influencerId
-            ? {
-                influencerId,
-                amount: 0,
-                releasedAmount: 0,
-                pendingAmount: 0,
-              }
-            : null,
         },
         requestId
       );
     }
 
-    syncWalletBalances(wallet);
-
-    const campaignFreeze = (wallet.freezes || []).find(
-      (f) =>
-        String(f.brandId) === String(brandId) &&
-        String(f.campaignId) === String(campaignId)
-    );
-
-    if (!campaignFreeze) {
-      return ApiResponse.sendOk(
-        res,
-        HttpStatus.OK,
-        {
-          brandId,
-          campaignId,
-          walletBalance: wallet.walletBalance,
-          frozenBalance: wallet.frozenBalance,
-          totalFrozenAmount: 0,
-          currentFrozenAmount: 0,
-          totalAllocatedAmount: 0,
-          totalReleasedAmount: 0,
-          availableToAllocate: 0,
-          influencer: influencerId
-            ? {
-                influencerId,
-                amount: 0,
-                releasedAmount: 0,
-                pendingAmount: 0,
-              }
-            : null,
-        },
-        requestId
-      );
-    }
-
-    syncCampaignFreeze(campaignFreeze);
-
-    let influencer = null;
-
-    if (influencerId) {
-      const allocation = (campaignFreeze.influencerAllocations || []).find(
-        (a) => String(a.influencerId) === String(influencerId)
-      );
-
-      influencer = allocation
-        ? {
-            influencerId,
-            amount: Number(allocation.amount || 0),
-            releasedAmount: Number(allocation.releasedAmount || 0),
-            pendingAmount: Number(allocation.pendingAmount || 0),
-            status: allocation.status || "allocated",
-          }
-        : {
-            influencerId,
-            amount: 0,
-            releasedAmount: 0,
-            pendingAmount: 0,
-          };
-    }
+    const snap = syncWalletBalances(wallet);
+    await wallet.save();
 
     return ApiResponse.sendOk(
       res,
       HttpStatus.OK,
       {
         brandId,
-        campaignId,
-        walletBalance: wallet.walletBalance,
-        frozenBalance: wallet.frozenBalance,
-        totalFrozenAmount: Number(campaignFreeze.totalFrozenAmount || 0),
-        currentFrozenAmount: Number(campaignFreeze.currentFrozenAmount || 0),
-        totalAllocatedAmount: Number(campaignFreeze.totalAllocatedAmount || 0),
-        totalReleasedAmount: Number(campaignFreeze.totalReleasedAmount || 0),
-        availableToAllocate: Number(campaignFreeze.availableToAllocate || 0),
-        influencer,
+        ...snap,
+        totalFrozenAmount: snap.escrowBalance,
+        currentFrozenAmount: snap.escrowBalance,
+        availableToAllocate: snap.walletBalance,
       },
       requestId
     );
   } catch (err) {
-    await saveErrorLog(req, err, 500, "GET_FROZEN_AMOUNT_FOR_CAMPAIGN_ERROR");
+    await saveErrorLog(req, err, 500, "GET_ESCROW_AMOUNT_ERROR");
     const message = err instanceof Error ? err.message : "Internal error";
 
     return ApiResponse.sendFail(
@@ -1087,7 +886,7 @@ const getFrozenAmountForCampaign = async (req, res) => {
 };
 
 // ======================================================================
-// GET /brand-wallet/topup-history?brandId=xxx
+// GET /brand-wallet/topupHistory?brandId=xxx
 // ======================================================================
 const getWalletTopup = async (req, res) => {
   const requestId = getRequestId(req);
@@ -1173,11 +972,7 @@ const getBrandWalletHistory = async (req, res) => {
       );
     }
 
-    const wallet = await BrandWalletModel.findOne({ brandId })
-      .select(
-        "brandId topups freezeHistories allocationHistories withdrawHistories"
-      )
-      .lean();
+    const wallet = await BrandWalletModel.findOne({ brandId }).lean();
 
     if (!wallet) {
       return ApiResponse.sendOk(
@@ -1186,8 +981,7 @@ const getBrandWalletHistory = async (req, res) => {
         {
           brandId,
           topups: [],
-          freezeHistories: [],
-          allocationHistories: [],
+          escrowHistories: [],
           withdrawHistories: [],
           transactions: [],
         },
@@ -1196,11 +990,8 @@ const getBrandWalletHistory = async (req, res) => {
     }
 
     const topups = Array.isArray(wallet.topups) ? wallet.topups : [];
-    const freezeHistories = Array.isArray(wallet.freezeHistories)
-      ? wallet.freezeHistories
-      : [];
-    const allocationHistories = Array.isArray(wallet.allocationHistories)
-      ? wallet.allocationHistories
+    const escrowHistories = Array.isArray(wallet.escrowHistories)
+      ? wallet.escrowHistories
       : [];
     const withdrawHistories = Array.isArray(wallet.withdrawHistories)
       ? wallet.withdrawHistories
@@ -1215,18 +1006,13 @@ const getBrandWalletHistory = async (req, res) => {
         createdAt: item.createdAt,
         raw: item,
       })),
-      ...freezeHistories.map((item) => ({
-        type: "campaign_freeze",
+      ...escrowHistories.map((item) => ({
+        type: item.type || "escrow",
         amount: item.amount,
-        campaignId: item.campaignId,
-        createdAt: item.createdAt,
-        raw: item,
-      })),
-      ...allocationHistories.map((item) => ({
-        type: "influencer_allocation",
-        amount: item.amount,
-        campaignId: item.campaignId,
-        influencerId: item.influencerId,
+        campaignId: item.campaignId || "",
+        influencerId: item.influencerId || "",
+        milestoneId: item.milestoneId || "",
+        milestoneHistoryId: item.milestoneHistoryId || "",
         createdAt: item.createdAt,
         raw: item,
       })),
@@ -1248,10 +1034,7 @@ const getBrandWalletHistory = async (req, res) => {
         topups: [...topups].sort(
           (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)
         ),
-        freezeHistories: [...freezeHistories].sort(
-          (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)
-        ),
-        allocationHistories: [...allocationHistories].sort(
+        escrowHistories: [...escrowHistories].sort(
           (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)
         ),
         withdrawHistories: [...withdrawHistories].sort(
@@ -1275,6 +1058,13 @@ const getBrandWalletHistory = async (req, res) => {
   }
 };
 
+// Backward-compatible helper name. Older code may import calcFrozenAll.
+const calcFrozenAll = (_freezes = [], wallet = null) =>
+  wallet ? syncWalletBalances(wallet).escrowBalance : 0;
+
+const syncCampaignFreeze = (freeze) => freeze || null;
+const ensureCampaignFreeze = (_wallet, _brandId, _campaignId) => null;
+
 module.exports = {
   getBrandWallet,
   topupBrandWallet,
@@ -1288,9 +1078,16 @@ module.exports = {
   getWalletTopup,
   getBrandWalletHistory,
 
+  // Helpers used by milestone/contract flows if needed.
+  roundMoney,
+  syncWalletBalances,
+  getOrCreateWallet,
+  moveAmountToEscrow,
+  refundAmountFromEscrow,
+  releaseAmountFromEscrow,
+
+  // Legacy helper exports.
   calcFrozenAll,
   syncCampaignFreeze,
-  syncWalletBalances,
   ensureCampaignFreeze,
-  getOrCreateWallet,
 };

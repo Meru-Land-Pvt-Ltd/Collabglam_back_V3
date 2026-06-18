@@ -1,62 +1,6 @@
 const mongoose = require("mongoose");
 const { Schema, model } = mongoose;
 
-const InfluencerAllocationSchema = new Schema(
-  {
-    influencerId: { type: String, required: true, index: true },
-
-    amount: { type: Number, default: 0, min: 0 },
-
-    releasedAmount: { type: Number, default: 0, min: 0 },
-
-    pendingAmount: { type: Number, default: 0, min: 0 },
-
-    status: {
-      type: String,
-      enum: ["allocated", "partially_released", "released"],
-      default: "allocated",
-      index: true,
-    },
-
-    allocatedAt: { type: Date, default: Date.now },
-    lastAllocatedAt: { type: Date, default: Date.now },
-  },
-  { _id: false }
-);
-
-const CampaignFreezeSchema = new Schema(
-  {
-    brandId: { type: String, required: true, index: true },
-    campaignId: { type: String, required: true, index: true },
-
-    totalFrozenAmount: { type: Number, default: 0, min: 0 },
-
-    currentFrozenAmount: { type: Number, default: 0, min: 0 },
-
-    availableToAllocate: { type: Number, default: 0, min: 0 },
-
-    totalAllocatedAmount: { type: Number, default: 0, min: 0 },
-
-    totalReleasedAmount: { type: Number, default: 0, min: 0 },
-
-    status: {
-      type: String,
-      enum: ["active", "fully_allocated", "released"],
-      default: "active",
-      index: true,
-    },
-
-    influencerAllocations: {
-      type: [InfluencerAllocationSchema],
-      default: [],
-    },
-
-    createdAt: { type: Date, default: Date.now },
-    updatedAt: { type: Date, default: Date.now },
-  },
-  { _id: false }
-);
-
 const WalletTopupSchema = new Schema(
   {
     amount: { type: Number, required: true, min: 0 },
@@ -92,42 +36,39 @@ const WalletTopupSchema = new Schema(
   { _id: false }
 );
 
-const FreezeHistorySchema = new Schema(
+const EscrowHistorySchema = new Schema(
   {
     brandId: { type: String, required: true, index: true },
-    campaignId: { type: String, required: true, index: true },
+
+    type: {
+      type: String,
+      enum: [
+        "milestone_escrow",
+        "milestone_escrow_adjustment",
+        "milestone_escrow_refund",
+        "milestone_release",
+        "manual_escrow",
+      ],
+      default: "milestone_escrow",
+      index: true,
+    },
 
     amount: { type: Number, required: true, min: 0 },
+    currency: { type: String, default: "usd", lowercase: true },
+
+    // These are audit/reference fields only. Wallet balance is no longer split by campaign.
+    campaignId: { type: String, default: "", index: true },
+    influencerId: { type: String, default: "", index: true },
+    contractId: { type: String, default: "" },
+    milestoneId: { type: String, default: "" },
+    milestoneHistoryId: { type: String, default: "" },
+    milestoneTitle: { type: String, default: "" },
 
     walletBalanceBefore: { type: Number, default: 0, min: 0 },
     walletBalanceAfter: { type: Number, default: 0, min: 0 },
 
-    frozenBalanceBefore: { type: Number, default: 0, min: 0 },
-    frozenBalanceAfter: { type: Number, default: 0, min: 0 },
-
-    campaignFrozenBefore: { type: Number, default: 0, min: 0 },
-    campaignFrozenAfter: { type: Number, default: 0, min: 0 },
-
-    note: { type: String, default: "" },
-
-    createdAt: { type: Date, default: Date.now },
-  },
-  { _id: false }
-);
-
-const AllocationHistorySchema = new Schema(
-  {
-    brandId: { type: String, required: true, index: true },
-    campaignId: { type: String, required: true, index: true },
-    influencerId: { type: String, required: true, index: true },
-
-    amount: { type: Number, required: true, min: 0 },
-
-    availableToAllocateBefore: { type: Number, default: 0, min: 0 },
-    availableToAllocateAfter: { type: Number, default: 0, min: 0 },
-
-    influencerAllocatedBefore: { type: Number, default: 0, min: 0 },
-    influencerAllocatedAfter: { type: Number, default: 0, min: 0 },
+    escrowBalanceBefore: { type: Number, default: 0, min: 0 },
+    escrowBalanceAfter: { type: Number, default: 0, min: 0 },
 
     note: { type: String, default: "" },
 
@@ -171,36 +112,41 @@ const WithdrawHistorySchema = new Schema(
 const BrandWalletSchema = new Schema(
   {
     brandId: { type: String, required: true, unique: true, index: true },
+
+    // Available wallet balance. This is the amount Brand can still use for new milestones.
     walletBalance: { type: Number, default: 0, min: 0 },
+
+    // Escrow balance. Money moves here immediately when a milestone is created.
+    escrowBalance: { type: Number, default: 0, min: 0 },
+
+    // Backward-compatible alias for older UI/API code that reads frozenBalance.
     frozenBalance: { type: Number, default: 0, min: 0 },
 
-    freezes: { type: [CampaignFreezeSchema], default: [] },
-
     topups: { type: [WalletTopupSchema], default: [] },
-
-    freezeHistories: { type: [FreezeHistorySchema], default: [] },
-
-    allocationHistories: { type: [AllocationHistorySchema], default: [] },
-
+    escrowHistories: { type: [EscrowHistorySchema], default: [] },
     withdrawHistories: { type: [WithdrawHistorySchema], default: [] },
+
+    // Legacy fields kept only so old documents/routes do not crash during migration.
+    freezes: { type: [Schema.Types.Mixed], default: [] },
+    freezeHistories: { type: [Schema.Types.Mixed], default: [] },
+    allocationHistories: { type: [Schema.Types.Mixed], default: [] },
   },
   { timestamps: true }
 );
 
+BrandWalletSchema.pre("validate", function syncLegacyFrozenBalance(next) {
+  const escrowBalance = Number(this.escrowBalance || this.frozenBalance || 0);
+  this.escrowBalance = Math.max(0, escrowBalance);
+  this.frozenBalance = this.escrowBalance;
+  this.walletBalance = Math.max(0, Number(this.walletBalance || 0));
+  next();
+});
+
 BrandWalletSchema.index({ brandId: 1 });
-BrandWalletSchema.index({ brandId: 1, "freezes.campaignId": 1 });
-BrandWalletSchema.index({
-  brandId: 1,
-  "freezes.campaignId": 1,
-  "freezes.influencerAllocations.influencerId": 1,
-});
 BrandWalletSchema.index({ brandId: 1, "topups.stripeSessionId": 1 });
-BrandWalletSchema.index({ brandId: 1, "freezeHistories.campaignId": 1 });
-BrandWalletSchema.index({
-  brandId: 1,
-  "allocationHistories.campaignId": 1,
-  "allocationHistories.influencerId": 1,
-});
+BrandWalletSchema.index({ brandId: 1, "escrowHistories.type": 1 });
+BrandWalletSchema.index({ brandId: 1, "escrowHistories.milestoneHistoryId": 1 });
+BrandWalletSchema.index({ brandId: 1, "escrowHistories.influencerId": 1 });
 
 const BrandWalletModel = model("BrandWallet", BrandWalletSchema);
 

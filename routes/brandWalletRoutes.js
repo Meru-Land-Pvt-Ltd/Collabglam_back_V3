@@ -5,8 +5,7 @@ const {
   getBrandWallet,
   topupBrandWallet,
   confirmBrandWalletTopup,
-
-  freezeAmountForCampaign,  
+  freezeAmountForCampaign,
   allocateToInfluencer,
   withdrawBrandWalletAmount,
 

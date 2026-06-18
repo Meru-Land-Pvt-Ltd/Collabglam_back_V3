@@ -3,6 +3,7 @@ const ApplyCampaign = require('../models/applyCampaign');
 const Campaign = require('../models/campaign');
 const { InfluencerModel } = require('../models/influencer');
 const Contract = require('../models/contract');
+const ContractSignature = require('../models/contractSignature');
 const { createAndEmit } = require('../utils/notifier');
 const Modash = require('../models/modash');
 const Brand = require('../models/brand');
@@ -16,7 +17,15 @@ const ACTIVE_CONTRACT_STATUSES = [
   'finalize',
   'signing',
   'locked',
-  'rejected'
+  'CONTRACT_SIGNED',
+  'MILESTONES_CREATED',
+];
+
+const SIGNED_CONTRACT_STATUSES = [
+  'CONTRACT_SIGNED',
+  'MILESTONES_CREATED',
+  'SIGNED',
+  'LOCKED',
 ];
 
 const FEATURE_KEYS = {
@@ -88,7 +97,14 @@ async function countActiveCollaborationsForInfluencer(influencerId) {
   return Contract.countDocuments({
     influencerId: String(influencerId),
     isRejected: { $ne: 1 },
-    $or: [{ isAssigned: 1 }, { isAccepted: 1 }, { status: { $in: ACTIVE_CONTRACT_STATUSES } }]
+    status: { $ne: 'REJECTED' },
+    $or: [
+      { isAssigned: 1 },
+      { isAccepted: 1 },
+      { lockedAt: { $exists: true, $ne: null } },
+      { status: { $in: ACTIVE_CONTRACT_STATUSES } },
+      { status: { $in: SIGNED_CONTRACT_STATUSES } },
+    ],
   });
 }
 
@@ -109,6 +125,170 @@ function normalizeStatus(s) {
 
 function normalizeRole(s) {
   return String(s || '').trim().toLowerCase();
+}
+
+function getIdStrings(...values) {
+  return [
+    ...new Set(
+      values
+        .flat()
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    ),
+  ];
+}
+
+function getObjectIds(values = []) {
+  return values
+    .filter((id) => mongoose.Types.ObjectId.isValid(String(id)))
+    .map((id) => new mongoose.Types.ObjectId(String(id)));
+}
+
+function buildCampaignIdContractClause(campaignIds = []) {
+  const ids = getIdStrings(campaignIds);
+  const objectIds = getObjectIds(ids);
+
+  return {
+    $or: [
+      { campaignId: { $in: ids } },
+      ...(objectIds.length ? [{ campaignId: { $in: objectIds } }] : []),
+    ],
+  };
+}
+
+function buildInfluencerIdContractClause(influencerIds = []) {
+  const ids = getIdStrings(influencerIds);
+  const objectIds = getObjectIds(ids);
+
+  return {
+    $or: [
+      { influencerId: { $in: ids } },
+      ...(objectIds.length ? [{ influencerId: { $in: objectIds } }] : []),
+      { 'influencer._id': { $in: ids } },
+      ...(objectIds.length ? [{ 'influencer._id': { $in: objectIds } }] : []),
+      { 'influencer.influencerId': { $in: ids } },
+    ],
+  };
+}
+
+function isSignedValue(value) {
+  if (value === true || value === 1) return true;
+  if (value === false || value === 0 || value == null) return false;
+  return String(value || '').trim() !== '';
+}
+
+function isSignedContractStatus(status) {
+  return SIGNED_CONTRACT_STATUSES.includes(normalizeStatus(status));
+}
+
+function isRoleSignedOnContract(contract = {}, role) {
+  const legacyKey = role === 'brand' ? 'signatureBrand' : 'signatureInfluencer';
+  const roleSignature = contract?.signatures?.[role] || {};
+
+  return Boolean(
+    isSignedValue(contract?.[legacyKey]) ||
+      roleSignature.signed === true ||
+      roleSignature.signed === 1 ||
+      roleSignature.at
+  );
+}
+
+function isFullySignedContract(contract = {}) {
+  return Boolean(
+    contract?.lockedAt ||
+      isSignedContractStatus(contract?.status || contract?.contractStatus) ||
+      (
+        isRoleSignedOnContract(contract, 'brand') &&
+        isRoleSignedOnContract(contract, 'influencer')
+      ) ||
+      (
+        contract?.__signedRoles instanceof Set &&
+        contract.__signedRoles.has('brand') &&
+        contract.__signedRoles.has('influencer')
+      )
+  );
+}
+
+async function attachContractSignatureRoles(contracts = []) {
+  const ids = getIdStrings(
+    contracts.map((contract) => contract?.contractId),
+    contracts.map((contract) => contract?._id)
+  );
+
+  if (!ids.length) return contracts;
+
+  const rows = await ContractSignature.find({
+    contractId: { $in: ids },
+    signed: true,
+    role: { $in: ['brand', 'influencer'] },
+  })
+    .select('contractId role signed')
+    .lean();
+
+  const rolesByContractId = new Map();
+
+  for (const row of rows || []) {
+    const key = String(row.contractId || '').trim();
+    const role = String(row.role || '').trim().toLowerCase();
+
+    if (!key || !role) continue;
+
+    if (!rolesByContractId.has(key)) {
+      rolesByContractId.set(key, new Set());
+    }
+
+    rolesByContractId.get(key).add(role);
+  }
+
+  return contracts.map((contract) => {
+    const contractKeys = getIdStrings(contract?.contractId, contract?._id);
+    const signedRoles = new Set();
+
+    for (const key of contractKeys) {
+      const roles = rolesByContractId.get(key);
+
+      if (!roles) continue;
+
+      roles.forEach((role) => signedRoles.add(role));
+    }
+
+    return {
+      ...contract,
+      __signedRoles: signedRoles,
+    };
+  });
+}
+
+function buildSignedContractPairSet(contracts = []) {
+  const set = new Set();
+
+  for (const contract of contracts) {
+    if (!isFullySignedContract(contract)) continue;
+
+    const campaignIds = getIdStrings(contract?.campaignId);
+    const influencerIds = getIdStrings(
+      contract?.influencerId,
+      contract?.influencer?._id,
+      contract?.influencer?.influencerId
+    );
+
+    for (const campaignId of campaignIds) {
+      for (const influencerId of influencerIds) {
+        set.add(`${String(campaignId)}::${String(influencerId)}`);
+      }
+    }
+  }
+
+  return set;
+}
+
+function hasSignedContractForApplicant(signedPairs, campaignIds = [], influencerId = '') {
+  const inf = String(influencerId || '').trim();
+  if (!inf) return false;
+
+  return getIdStrings(campaignIds).some((campaignId) =>
+    signedPairs.has(`${String(campaignId)}::${inf}`)
+  );
 }
 
 function pickModashProfile(profiles = []) {
@@ -768,6 +948,8 @@ exports.getListByCampaign = async (req, res) => {
         String(contract?.isFinalUpdate).toLowerCase() === 'true' ||
         Number(contract?.isFinalUpdate) === 1;
 
+      const isSignedContract = isFullySignedContract(contract);
+
       const isCompleted =
         lifecycleStatus === 'completed' || lifecycleStatus === 'complete' ? 1 : 0;
 
@@ -775,9 +957,12 @@ exports.getListByCampaign = async (req, res) => {
         !isRejectedContract &&
           isCompleted === 0 &&
           (
+            isSignedContract ||
             lifecycleStatusRaw === 'INFLUENCER_ACCEPTED' ||
             lifecycleStatusRaw === 'READY_TO_SIGN' ||
-            lifecycleStatusRaw === 'MILESTONES_CREATED'
+            lifecycleStatusRaw === 'CONTRACT_SIGNED' ||
+            lifecycleStatusRaw === 'MILESTONES_CREATED' ||
+            lifecycleStatusRaw === 'LOCKED'
           )
           ? 1
           : 0;
@@ -979,15 +1164,15 @@ exports.getListByCampaign = async (req, res) => {
       campaignObjectIdFilters.push({ _id: new mongoose.Types.ObjectId(String(campaignId)) });
     }
 
-    const campaignDoc = await Campaign.findOne({
-      $or: [
-        { campaignsId: String(campaignId) },
-        { campaignId: String(campaignId) },
-        ...campaignObjectIdFilters,
-      ],
-    })
-      .select("_id brandId campaignsId campaignId createdBy approvalMode fullyManagedSubscription brandPlanName subscription planName")
-      .lean();
+const campaignDoc = await Campaign.findOne({
+  $or: [
+    { campaignsId: String(campaignId) },
+    { campaignId: String(campaignId) },
+    ...campaignObjectIdFilters,
+  ],
+})
+  .select("_id brandId campaignsId campaignId createdBy approvalMode fullyManagedSubscription brandPlanName subscription planName budget campaignBudget influencerBudget")
+  .lean();
 
     let brandForCampaign = null;
     if (campaignDoc?.brandId) {
@@ -1130,9 +1315,18 @@ exports.getListByCampaign = async (req, res) => {
       modashByInf.get(key).push(profile);
     }
 
-    const contracts = await Contract.find({
-      campaignId: String(campaignId)
-    }).lean();
+    const campaignIdVariants = [
+      String(campaignId),
+      campaignDoc?._id ? String(campaignDoc._id) : '',
+      campaignDoc?.campaignsId ? String(campaignDoc.campaignsId) : '',
+      campaignDoc?.campaignId ? String(campaignDoc.campaignId) : '',
+    ].filter(Boolean);
+
+    const contracts = await attachContractSignatureRoles(
+      await Contract.find(
+        buildCampaignIdContractClause(campaignIdVariants)
+      ).lean()
+    );
 
     const isContractedCampaign = contracts.length > 0 ? 1 : 0;
 
@@ -1251,6 +1445,16 @@ exports.getListByCampaign = async (req, res) => {
           normalizeText(applicantStatuses.statusInfluencer) !== "rejected"
         );
 
+        const contractFeeAmount = Number(contract?.feeAmount || 0);
+
+const campaignBudget =
+  Number(campaignDoc?.budget || 0) ||
+  Number(campaignDoc?.campaignBudget || 0) ||
+  Number(campaignDoc?.influencerBudget || 0) ||
+  0;
+
+const rowBudget = contractFeeAmount > 0 ? contractFeeAmount : campaignBudget;
+
       const baseRow = {
         influencerId: infIdStr,
         name: inf.name || '',
@@ -1291,7 +1495,13 @@ exports.getListByCampaign = async (req, res) => {
         isAssigned,
         isContracted,
         contractId: contract?._id || null,
-        feeAmount: contract?.feeAmount || 0,
+        contractPublicId: contract?.contractId || null,
+        contractStatus: contract?.status || null,
+        contractLockedAt: contract?.lockedAt || null,
+        isContractSigned: isFullySignedContract(contract) ? 1 : 0,
+        feeAmount: rowBudget,
+        campaignBudget,
+        contractFeeAmount,
         isAccepted,
         isContractRejected,
         rejectedReason: isContractRejected ? contract?.rejectedReason || '' : ''
@@ -1808,13 +2018,18 @@ exports.getBrandCampaignsWithAppliedInfluencers = async (req, res) => {
     };
 
     // Only show pure applied influencers.
-    // Hide influencer if shortlisted, undecided, or rejected is 1.
-    const isOnlyAppliedApplicant = (applicant) => {
+    // Hide influencer if shortlisted, undecided, rejected, or already fully signed.
+    const isOnlyAppliedApplicant = (applicant, campaignIds = [], signedContractPairs = new Set()) => {
       return (
         Number(applicant?.isShortlisted) !== 1 &&
         Number(applicant?.isUndicided) !== 1 &&
         Number(applicant?.isUndecided) !== 1 &&
-        Number(applicant?.isRejected) !== 1
+        Number(applicant?.isRejected) !== 1 &&
+        !hasSignedContractForApplicant(
+          signedContractPairs,
+          campaignIds,
+          applicant?.influencerId
+        )
       );
     };
 
@@ -1879,6 +2094,18 @@ exports.getBrandCampaignsWithAppliedInfluencers = async (req, res) => {
       if (campaign?.campaignId) campaignCandidateIds.push(String(campaign.campaignId));
     }
 
+    const signedContractsForAppliedLists = await attachContractSignatureRoles(
+      await Contract.find({
+        ...buildCampaignIdContractClause(campaignCandidateIds),
+        isRejected: { $ne: 1 },
+        status: { $ne: 'REJECTED' },
+      })
+        .select('_id contractId campaignId influencerId influencer status lockedAt signatures signatureBrand signatureInfluencer isRejected')
+        .lean()
+    );
+
+    const signedContractPairs = buildSignedContractPairSet(signedContractsForAppliedLists);
+
     const applyRecords = await ApplyCampaign.find({
       campaignId: { $in: campaignCandidateIds },
     }).lean();
@@ -1899,7 +2126,10 @@ exports.getBrandCampaignsWithAppliedInfluencers = async (req, res) => {
         ? record.applicants
         : [];
 
-      const onlyAppliedApplicants = applicants.filter(isOnlyAppliedApplicant);
+      const campaignIds = [record?.campaignId].filter(Boolean);
+      const onlyAppliedApplicants = applicants.filter((applicant) =>
+        isOnlyAppliedApplicant(applicant, campaignIds, signedContractPairs)
+      );
 
       for (const applicant of onlyAppliedApplicants) {
         if (
@@ -1964,7 +2194,9 @@ exports.getBrandCampaignsWithAppliedInfluencers = async (req, res) => {
         ? applyRecord.applicants
         : [];
 
-      const onlyAppliedApplicants = applicants.filter(isOnlyAppliedApplicant);
+      const onlyAppliedApplicants = applicants.filter((applicant) =>
+        isOnlyAppliedApplicant(applicant, campaignIds, signedContractPairs)
+      );
 
       const appliedInfluencers = onlyAppliedApplicants
         .map((applicant) => {
@@ -2029,7 +2261,9 @@ exports.getBrandCampaignsWithAppliedInfluencers = async (req, res) => {
           brandDoc?.brandName ||
           campaigns?.[0]?.brandName ||
           "",
-        campaigns: formattedCampaigns,
+        campaigns: formattedCampaigns.filter(
+          (campaign) => Number(campaign.appliedInfluencerCount || 0) > 0
+        ),
       },
     });
   } catch (err) {
