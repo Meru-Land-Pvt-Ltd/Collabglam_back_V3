@@ -27,6 +27,13 @@ const Campaign =
     '../models/campaign',
   ]) || null;
 
+const InfoMediaKit =
+  tryRequireModel([
+    '../models/infoMediaKit.model',
+    '../models/infoMediaKit',
+    '../models/InfoMediaKit',
+  ]) || null;
+
 /* -------------------------------------------------------------------------- */
 /*                            YouTube key rotation                            */
 /* -------------------------------------------------------------------------- */
@@ -2309,6 +2316,31 @@ function buildBrandMediaKitData(creator, context = {}) {
 async function getCreatorMediaKit(req, res) {
   try {
     const channelId = cleanStr(req.params.channelId);
+    if (!channelId) {
+      return res.status(400).json({ success: false, error: 'channelId is required' });
+    }
+
+    // First return saved media kit data from the new infomediakit collection.
+    // This does not save brandId/userId/who opened it. One saved media kit is shared for future opens.
+    if (InfoMediaKit) {
+      const cachedMediaKit = await InfoMediaKit.findOne({ channelId }).lean();
+      if (cachedMediaKit?.mediaKitData) {
+        InfoMediaKit.updateOne(
+          { channelId },
+          {
+            $inc: { openCount: 1 },
+            $set: { lastOpenedAt: new Date() },
+          }
+        ).catch(() => {});
+
+        return res.status(200).json({
+          success: true,
+          data: cachedMediaKit.mediaKitData,
+          fromCache: true,
+        });
+      }
+    }
+
     const creator = await YouTubeData.findOne({ channelId }).lean();
     if (!creator) return res.status(404).json({ success: false, error: 'YouTube creator not found' });
 
@@ -2320,9 +2352,42 @@ async function getCreatorMediaKit(req, res) {
 
     const mediaKit = buildBrandMediaKitData(creator, context);
 
+    // Save generated media kit in infomediakit table for next open.
+    // No brandId/userId is stored here.
+    if (InfoMediaKit) {
+      try {
+        await InfoMediaKit.updateOne(
+          { channelId },
+          {
+            $set: {
+              platform: 'youtube',
+              channelId,
+              channelName: creator.channelName || mediaKit?.creatorOverview?.channelName || '',
+              channelUrl: creator.channelUrl || '',
+              thumbnail: creator.thumbnail || mediaKit?.creatorOverview?.profilePhoto || '',
+              country: creator.country || mediaKit?.creatorOverview?.country || '',
+              estimatedAudienceCountry:
+                creator.estimatedAudienceCountry || mediaKit?.creatorOverview?.estimatedAudienceCountry || '',
+              creatorTier: getTierFromSubscribers(creator.subscribers),
+              subscribers: Number(creator.subscribers || 0),
+              mediaKitData: mediaKit,
+              rawCreatorSnapshot: creator,
+              lastOpenedAt: new Date(),
+            },
+            $inc: { openCount: 1 },
+            $setOnInsert: { createdAt: new Date() },
+          },
+          { upsert: true }
+        );
+      } catch (saveErr) {
+        await saveErrorLog(req, saveErr, saveErr?.status || 500, 'INFOMEDIAKIT_SAVE_FAILED');
+      }
+    }
+
     return res.status(200).json({
       success: true,
       data: mediaKit,
+      fromCache: false,
     });
   } catch (err) {
     await saveErrorLog(req, err, err?.status || 500, 'YOUTUBE_BRAND_MEDIA_KIT');
