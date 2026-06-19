@@ -8,6 +8,7 @@ const {
   getInvitationList,
   getInvitationSendEligibility,
   sendInvitationFollowUp,
+  getAllInvitations
 } = require("../controllers/NewInvitationsController");
 
 router.post("/create", createInvitation);
@@ -16,5 +17,6 @@ router.post("/list", listInvitations);
 router.post("/getList", getInvitationList);
 router.post("/eligibility", getInvitationSendEligibility);
 router.post("/followup", sendInvitationFollowUp);
+router.post("/getall", getAllInvitations);
 
 module.exports = router;

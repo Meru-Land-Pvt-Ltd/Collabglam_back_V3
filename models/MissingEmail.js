@@ -1,4 +1,3 @@
-// models/MissingEmail.js
 const mongoose = require("mongoose");
 const { v4: uuidv4 } = require("uuid");
 
@@ -6,39 +5,6 @@ const EMAIL_RX = /^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/;
 const HANDLE_RX = /^@[A-Za-z0-9._\-]+$/;
 
 const PLATFORM_ENUM = ["youtube"];
-
-const YouTubeSchema = new mongoose.Schema(
-  {
-    channelId: { type: String, index: true },
-    title: { type: String },
-    handle: { type: String },
-    urlByHandle: { type: String },
-    urlById: { type: String },
-    description: { type: String },
-    country: { type: String },
-    subscriberCount: { type: Number, min: 0 },
-    videoCount: { type: Number, min: 0 },
-    viewCount: { type: Number, min: 0 },
-    topicCategories: [{ type: String }],
-    topicCategoryLabels: [{ type: String }],
-    fetchedAt: { type: Date },
-  },
-  { _id: false }
-);
-
-const EmailTemplateSnapshotSchema = new mongoose.Schema(
-  {
-    from: { type: String, default: null, lowercase: true, trim: true },
-    subject: { type: String, default: "", trim: true },
-    text: { type: String, default: "" },
-    html: { type: String, default: "" },
-    cc: [{ type: String, lowercase: true, trim: true }],
-    bcc: [{ type: String, lowercase: true, trim: true }],
-    replyTo: [{ type: String, lowercase: true, trim: true }],
-    attachmentNames: [{ type: String, trim: true }],
-  },
-  { _id: false }
-);
 
 const MissingEmailCampaignSchema = new mongoose.Schema(
   {
@@ -62,9 +28,40 @@ const MissingEmailCampaignSchema = new mongoose.Schema(
       trim: true,
     },
 
-    emailTemplate: {
-      type: EmailTemplateSnapshotSchema,
-      default: undefined,
+    handle: {
+      type: String,
+      required: [true, "Handle is required"],
+      lowercase: true,
+      trim: true,
+      set: (v) => {
+        if (!v) return v;
+        const t = String(v).trim().toLowerCase();
+        return t.startsWith("@") ? t : `@${t}`;
+      },
+      validate: {
+        validator: (v) => HANDLE_RX.test(v || ""),
+        message:
+          'Handle must start with "@" and contain letters, numbers, ".", "_" or "-"',
+      },
+    },
+
+    platform: {
+      type: String,
+      required: true,
+      lowercase: true,
+      trim: true,
+      enum: {
+        values: PLATFORM_ENUM,
+        message: "Platform must be youtube",
+      },
+      default: "youtube",
+    },
+
+    channelId: {
+      type: String,
+      default: null,
+      trim: true,
+      index: true,
     },
 
     requestedAt: {
@@ -102,6 +99,11 @@ const MissingEmailSchema = new mongoose.Schema(
       required: [true, "Handle is required"],
       lowercase: true,
       trim: true,
+      set: (v) => {
+        if (!v) return v;
+        const t = String(v).trim().toLowerCase();
+        return t.startsWith("@") ? t : `@${t}`;
+      },
       validate: {
         validator: (v) => HANDLE_RX.test(v || ""),
         message:
@@ -121,16 +123,18 @@ const MissingEmailSchema = new mongoose.Schema(
       default: "youtube",
     },
 
+    channelId: {
+      type: String,
+      default: null,
+      trim: true,
+      index: true,
+    },
+
     status: {
       type: String,
       enum: ["pending", "resolved"],
       default: "pending",
       index: true,
-    },
-
-    youtube: {
-      type: YouTubeSchema,
-      default: undefined,
     },
 
     campaigns: {
@@ -148,12 +152,14 @@ const MissingEmailSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-MissingEmailSchema.index({ handle: 1 }, { unique: true });
+MissingEmailSchema.index({ handle: 1, platform: 1 }, { unique: true });
 MissingEmailSchema.index({ email: 1 }, { sparse: true });
+MissingEmailSchema.index({ channelId: 1 }, { sparse: true });
 MissingEmailSchema.index({ createdAt: -1 });
-MissingEmailSchema.index({ "youtube.channelId": 1 }, { sparse: true });
 MissingEmailSchema.index({ handle: 1, "campaigns.campaignId": 1 });
+MissingEmailSchema.index({ channelId: 1, "campaigns.campaignId": 1 });
 MissingEmailSchema.index({ "campaigns.brandId": 1, "campaigns.campaignId": 1 });
+MissingEmailSchema.index({ "campaigns.channelId": 1 });
 
 module.exports =
   mongoose.models.MissingEmail ||

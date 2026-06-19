@@ -50,8 +50,6 @@ const InfoMediaKitSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
-    // Store creator email at top-level so it is visible directly in the infomediakit table.
-    // This is the original email. Frontend is responsible for masking before display.
     email: {
       type: String,
       default: '',
