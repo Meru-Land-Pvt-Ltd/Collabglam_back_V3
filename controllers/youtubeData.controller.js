@@ -2579,7 +2579,7 @@ function selectCampaignRecommendationCreatorsFromSplit(split = {}, { limit = 50,
   const exact = sortRecommendedCreators(split.exact || []);
 
   // Tier remains first priority. After exact tier+country+category matches, fill
-  // up to 25 using same-country campaign creators discovered from the campaign
+  // up to 50 using same-country campaign creators discovered from the campaign
   // search terms. This matches the Apps Script style flow: query -> source video
   // -> channel -> shortlist, instead of returning an empty/9-result page.
   const fallbackPool = hardCountry
@@ -2597,7 +2597,7 @@ function selectCampaignRecommendationCreatorsFromSplit(split = {}, { limit = 50,
         ...(split.rest || []),
       ]);
 
-  // Always cap at 25, but do not stop at 9 just because exact-tier matches are low.
+  // Always cap at 50, but do not stop at 9/25 just because exact-tier matches are low.
   // The fallback pool is still built from campaign-search/source-video channels,
   // with same-country creators first, so it follows the Apps Script-style logic.
   return uniqueRecommendedCreatorsByChannel([...exact, ...fallbackPool]).slice(0, finalLimit);
@@ -2989,7 +2989,10 @@ async function recommendInfluencersForCampaign(req, res) {
     );
 
     const save = String(req.body.save ?? req.query.save ?? 'true').toLowerCase() !== 'false';
-    const hardCountry = String(req.body.strictCountry ?? req.query.strictCountry ?? 'true').toLowerCase() !== 'false';
+    // Invite recommendations should not return an empty page just because a campaign
+    // has uncommon target countries. Default to relaxed country matching; exact
+    // country creators are still ranked first, then fallback creators fill up to 50.
+    const hardCountry = String(req.body.strictCountry ?? req.query.strictCountry ?? 'false').toLowerCase() === 'true';
     const forceRefresh =
       String(req.body.forceRefresh ?? req.query.forceRefresh ?? 'false').toLowerCase() === 'true' ||
       String(req.body.force ?? req.query.force ?? 'false').toLowerCase() === 'true';
@@ -3015,9 +3018,10 @@ async function recommendInfluencersForCampaign(req, res) {
       minSubscribers: requestedTierRange.minSubscribers,
       maxSubscribers: requestedTierRange.maxSubscribers,
       subscriberTier: campaignDetails.subscriberTier,
-      // Tier is the main rule for campaign recommendations.
-      strictFilters: true,
-      strictTier: Boolean(campaignDetails.subscriberTier),
+      // Rank tier/country/category matches first, but do not hard-filter them.
+      // This keeps the invitation page filled with up to 50 relevant creators.
+      strictFilters: false,
+      strictTier: false,
     };
 
     const buildResponse = ({ creators, refreshedCount = 0, savedCount = 0, fromCache = false, warning = undefined }) => ({
@@ -3118,9 +3122,9 @@ async function recommendInfluencersForCampaign(req, res) {
       minSubscribers: requestedTierRange.minSubscribers,
       maxSubscribers: requestedTierRange.maxSubscribers,
       minAvgViews: 500,
-      // Do not hard-block discovery by tier. Tier is handled in ranking/selection
-      // so exact tier is shown first, but the API can still return 25 relevant
-      // campaign creators when the selected tier has too few exact matches.
+      // Do not hard-block discovery by tier/country. Tier and country are handled
+      // in ranking/selection so exact matches appear first, while fallback creators
+      // can still fill the invite page up to 50.
       strictFilters: false,
       strictTier: false,
       strictCountry: hardCountry,
@@ -3143,7 +3147,13 @@ async function recommendInfluencersForCampaign(req, res) {
 
     const activeSinceDate = getCreatorLookbackStartDate();
 
-    const loadCreators = async ({ useKeyword = true, useCategory = true, useCountry = true }) => {
+    const loadCreators = async ({
+      useKeyword = true,
+      useCategory = true,
+      useCountry = true,
+      useCampaign = true,
+      useActiveSince = true,
+    }) => {
       const filter = buildMongoFilter({
         keyword: useKeyword ? keyword : '',
         country: useCountry && hardCountry ? country : '',
@@ -3152,15 +3162,15 @@ async function recommendInfluencersForCampaign(req, res) {
         minAvgViews: null,
         minEngagement: null,
         category: useCategory ? category : '',
-        campaignId,
+        campaignId: useCampaign ? campaignId : '',
         includeExcluded: false,
         strictFilters: false,
-        activeSinceDate,
+        activeSinceDate: useActiveSince ? activeSinceDate : null,
       });
 
       const docs = await YouTubeData.find(filter)
         .sort(SORT_MAP.relevance)
-        .limit(Math.max(limit * 2, minimumInfluencers * 2, 80))
+        .limit(Math.max(limit * 3, minimumInfluencers * 3, 150))
         .lean();
 
       return sortDiscoveryDataForSelectedFilters(
@@ -3176,23 +3186,33 @@ async function recommendInfluencersForCampaign(req, res) {
       return uniqueRecommendedCreatorsByChannel(candidatePools).length;
     };
 
-    await addCandidatePool({ useKeyword: true, useCategory: true, useCountry: Boolean(country) });
+    await addCandidatePool({ useKeyword: true, useCategory: true, useCountry: Boolean(country), useCampaign: true });
 
     if (uniqueRecommendedCreatorsByChannel(candidatePools).length < minimumInfluencers) {
-      await addCandidatePool({ useKeyword: false, useCategory: true, useCountry: Boolean(country) });
+      await addCandidatePool({ useKeyword: false, useCategory: true, useCountry: Boolean(country), useCampaign: true });
     }
 
     if (uniqueRecommendedCreatorsByChannel(candidatePools).length < minimumInfluencers) {
-      // Last strict-country fallback: use all creators discovered/saved for this
-      // campaign, then let recommendation scoring decide the top 25. The Mongo
-      // filter still includes campaignId, so this does not pull random creators.
-      await addCandidatePool({ useKeyword: false, useCategory: false, useCountry: Boolean(country) });
+      // Campaign-level fallback: use all creators discovered/saved for this campaign,
+      // then let recommendation scoring decide the top 50.
+      await addCandidatePool({ useKeyword: false, useCategory: false, useCountry: Boolean(country), useCampaign: true });
     }
 
-    // Never remove the country filter when strictCountry=true. This prevents India/Brazil/etc.
-    // creators from being returned for a US campaign.
-    if (uniqueRecommendedCreatorsByChannel(candidatePools).length < minimumInfluencers && !hardCountry) {
-      await addCandidatePool({ useKeyword: false, useCategory: true, useCountry: false });
+    if (uniqueRecommendedCreatorsByChannel(candidatePools).length < minimumInfluencers) {
+      // Global niche fallback: if this campaign has too few saved/discovered rows,
+      // pull relevant YouTube creators from the wider YouTubeData collection.
+      await addCandidatePool({ useKeyword: false, useCategory: true, useCountry: false, useCampaign: false });
+    }
+
+    if (uniqueRecommendedCreatorsByChannel(candidatePools).length < minimumInfluencers) {
+      // Final fallback: fill the page from active YouTube creators across niches.
+      // The ranking step still puts exact tier/country/category matches first.
+      await addCandidatePool({ useKeyword: false, useCategory: false, useCountry: false, useCampaign: false });
+    }
+
+    if (uniqueRecommendedCreatorsByChannel(candidatePools).length < minimumInfluencers) {
+      // Older but saved creators are better than an empty invite page.
+      await addCandidatePool({ useKeyword: false, useCategory: false, useCountry: false, useCampaign: false, useActiveSince: false });
     }
 
     const candidateCreators = uniqueRecommendedCreatorsByChannel(candidatePools);
@@ -3222,7 +3242,7 @@ async function recommendInfluencersForCampaign(req, res) {
         fromCache: false,
         warning:
           creators.length < minimumInfluencers
-            ? `Only ${creators.length} creators were found for this campaign. Exact selected-tier creators are shown first; remaining slots use same-country campaign-relevant creators from the Apps Script-style discovery flow. This endpoint is capped at ${limit}.`
+            ? `Only ${creators.length} creators were found. Exact campaign matches are shown first; fallback YouTube creators are used only when strict country/tier/category matches are too limited. This endpoint is capped at ${limit}.`
             : undefined,
       })
     );
