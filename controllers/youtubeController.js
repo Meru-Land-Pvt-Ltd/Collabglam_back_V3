@@ -21,8 +21,15 @@ const asyncHandler = (fn, errorCode = 'YOUTUBE_CONTROLLER_ERROR') => async (req,
   }
 };
 
-const YT_API_KEY = process.env.YOUTUBE_API_KEY;
+const YT_API_KEYS = String(process.env.YOUTUBE_API_KEY || '')
+  .split(',')
+  .map((key) => key.trim())
+  .filter(Boolean);
+
+const YT_API_KEY = YT_API_KEYS[0] || '';
 const YT_TIMEOUT_MS = Number(process.env.YOUTUBE_TIMEOUT_MS || 12000);
+
+let ytApiKeyCursor = 0;
 
 const httpAgent = new Agent({
   keepAliveTimeout: 60_000,
@@ -482,32 +489,91 @@ async function buildYouTubeProfileData(channel, opts = {}) {
   };
 }
 
+function withYouTubeApiKey(url, apiKey) {
+  const u = new URL(url);
+
+  if (apiKey) {
+    u.searchParams.set('key', apiKey);
+  }
+
+  return u.toString();
+}
+
+function shouldRetryWithNextYouTubeKey(status, bodyText = '') {
+  const text = String(bodyText || '').toLowerCase();
+
+  return (
+    [400, 403, 429].includes(Number(status)) &&
+    (
+      text.includes('quotaexceeded') ||
+      text.includes('dailylimitexceeded') ||
+      text.includes('ratelimitexceeded') ||
+      text.includes('userratelimitexceeded') ||
+      text.includes('keyinvalid') ||
+      text.includes('api key not valid') ||
+      text.includes('forbidden')
+    )
+  );
+}
+
 // ======================================================
 // HTTP fetch wrapper
 // ======================================================
 async function ytFetch(url, timeoutMs = YT_TIMEOUT_MS) {
-  const ac = new AbortController();
-  const t = setTimeout(
-    () => ac.abort(new Error('YouTube API timeout')),
-    timeoutMs
-  );
-
-  try {
-    const r = await fetch(url, {
-      dispatcher: httpAgent,
-      signal: ac.signal,
-    });
-
-    if (!r.ok) {
-      const txt = await r.text().catch(() => '');
-      throw new Error(`YouTube API ${r.status}: ${txt || r.statusText}`);
-    }
-
-
-    return await r.json();
-  } finally {
-    clearTimeout(t);
+  if (!YT_API_KEYS.length) {
+    const err = new Error('Missing YOUTUBE_API_KEY');
+    err.status = 500;
+    err.statusCode = 500;
+    throw err;
   }
+
+  let lastError = null;
+
+  for (let attempt = 0; attempt < YT_API_KEYS.length; attempt += 1) {
+    const keyIndex = (ytApiKeyCursor + attempt) % YT_API_KEYS.length;
+    const apiKey = YT_API_KEYS[keyIndex];
+    const requestUrl = withYouTubeApiKey(url, apiKey);
+
+    const ac = new AbortController();
+    const t = setTimeout(
+      () => ac.abort(new Error('YouTube API timeout')),
+      timeoutMs
+    );
+
+    try {
+      const r = await fetch(requestUrl, {
+        dispatcher: httpAgent,
+        signal: ac.signal,
+      });
+
+      if (!r.ok) {
+        const txt = await r.text().catch(() => '');
+
+        const err = new Error(`YouTube API ${r.status}: ${txt || r.statusText}`);
+        err.status = r.status;
+        err.statusCode = r.status;
+        err.youtubeBody = txt;
+
+        lastError = err;
+
+        if (
+          attempt < YT_API_KEYS.length - 1 &&
+          shouldRetryWithNextYouTubeKey(r.status, txt)
+        ) {
+          continue;
+        }
+
+        throw err;
+      }
+
+      ytApiKeyCursor = keyIndex;
+      return await r.json();
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  throw lastError || new Error('YouTube API request failed');
 }
 
 /* -------------------------------------------------------------------------- */

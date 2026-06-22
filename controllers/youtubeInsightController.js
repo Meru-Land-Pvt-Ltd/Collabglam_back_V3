@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { fetch, Agent } = require('undici');
 const mongoose = require('mongoose');
 const YoutubeInsightReport = require('../models/youtubeInsightReport');
 const YoutubeInsightPublicShare = require('../models/youtubeInsightPublicShare');
@@ -12,6 +13,25 @@ const {
 const saveErrorLog = require('../services/errorLog.service');
 
 const ADMIN_ROLES_WITH_FULL_REPORT_ACCESS = new Set(['super_admin', 'revenue_head']);
+
+
+const YT_API_KEYS = String(process.env.YOUTUBE_API_KEY || '')
+  .split(',')
+  .map((key) => key.trim())
+  .filter(Boolean);
+const YT_API_KEY = YT_API_KEYS[0] || '';
+const YT_TIMEOUT_MS = Number(process.env.YOUTUBE_TIMEOUT_MS || 12000);
+let ytApiKeyCursor = 0;
+
+const youtubeHttpAgent = new Agent({
+  keepAliveTimeout: 60_000,
+  keepAliveMaxTimeout: 60_000,
+});
+
+const YT_CHANNELS = 'https://www.googleapis.com/youtube/v3/channels';
+const YT_PLAYLIST_ITEMS = 'https://www.googleapis.com/youtube/v3/playlistItems';
+const YT_SEARCH = 'https://www.googleapis.com/youtube/v3/search';
+const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 
 function escapeRegex(value = '') {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -96,6 +116,339 @@ function getYoutubeLinkFromRequest(req = {}) {
     query.url ||
     query.videoId
   );
+}
+
+
+function withYouTubeApiKey(url, apiKey) {
+  const u = new URL(url);
+  if (apiKey) u.searchParams.set('key', apiKey);
+  return u.toString();
+}
+
+function shouldRetryWithNextYouTubeKey(status, bodyText = '') {
+  const text = String(bodyText || '').toLowerCase();
+
+  return (
+    [400, 403, 429].includes(Number(status)) &&
+    (
+      text.includes('quotaexceeded') ||
+      text.includes('dailylimitexceeded') ||
+      text.includes('ratelimitexceeded') ||
+      text.includes('userratelimitexceeded') ||
+      text.includes('keyinvalid') ||
+      text.includes('api key not valid') ||
+      text.includes('forbidden')
+    )
+  );
+}
+
+async function youtubeApiFetch(url, timeoutMs = YT_TIMEOUT_MS) {
+  if (!YT_API_KEYS.length) {
+    const err = new Error('Missing YOUTUBE_API_KEY');
+    err.status = 500;
+    err.statusCode = 500;
+    throw err;
+  }
+
+  let lastError = null;
+
+  for (let attempt = 0; attempt < YT_API_KEYS.length; attempt += 1) {
+    const keyIndex = (ytApiKeyCursor + attempt) % YT_API_KEYS.length;
+    const requestUrl = withYouTubeApiKey(url, YT_API_KEYS[keyIndex]);
+    const ac = new AbortController();
+    const timeout = setTimeout(
+      () => ac.abort(new Error('YouTube API timeout')),
+      timeoutMs
+    );
+
+    try {
+      const response = await fetch(requestUrl, {
+        dispatcher: youtubeHttpAgent,
+        signal: ac.signal,
+      });
+
+      if (!response.ok) {
+        const bodyText = await response.text().catch(() => '');
+        const err = new Error(`YouTube API ${response.status}: ${bodyText || response.statusText}`);
+        err.status = response.status;
+        err.statusCode = response.status;
+        err.youtubeBody = bodyText;
+        lastError = err;
+
+        if (
+          attempt < YT_API_KEYS.length - 1 &&
+          shouldRetryWithNextYouTubeKey(response.status, bodyText)
+        ) {
+          continue;
+        }
+
+        throw err;
+      }
+
+      ytApiKeyCursor = keyIndex;
+      return response.json();
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw lastError || new Error('YouTube API request failed');
+}
+
+function isYoutubeHost(hostname = '') {
+  const host = String(hostname || '').toLowerCase();
+  return host === 'youtu.be' || host.endsWith('.youtu.be') || host === 'youtube.com' || host.endsWith('.youtube.com');
+}
+
+function extractYoutubeVideoId(input = '') {
+  const raw = clean(input);
+  if (!raw) return null;
+
+  if (YOUTUBE_VIDEO_ID_RE.test(raw) && !raw.startsWith('UC')) return raw;
+
+  try {
+    const url = new URL(raw);
+    if (!isYoutubeHost(url.hostname)) return null;
+
+    if (url.hostname.toLowerCase().includes('youtu.be')) {
+      const id = clean(url.pathname.split('/').filter(Boolean)[0]);
+      return YOUTUBE_VIDEO_ID_RE.test(id) ? id : null;
+    }
+
+    const fromQuery = clean(url.searchParams.get('v'));
+    if (YOUTUBE_VIDEO_ID_RE.test(fromQuery)) return fromQuery;
+
+    const parts = url.pathname.split('/').filter(Boolean);
+    const videoPathKeys = new Set(['shorts', 'embed', 'live', 'v']);
+    if (parts.length >= 2 && videoPathKeys.has(parts[0])) {
+      const id = clean(parts[1]);
+      return YOUTUBE_VIDEO_ID_RE.test(id) ? id : null;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function extractYoutubeHandle(input = '') {
+  const raw = clean(input);
+  if (!raw) return null;
+
+  const match = raw.match(/@([A-Za-z0-9._-]+)/);
+  if (!match?.[1]) return null;
+
+  return `@${match[1]}`;
+}
+
+function extractYoutubeChannelId(input = '') {
+  const raw = clean(input);
+  if (!raw) return null;
+
+  const match = raw.match(/\b(UC[A-Za-z0-9_-]{20,})\b/);
+  return match?.[1] || null;
+}
+
+function getYoutubeUrlPathParts(input = '') {
+  try {
+    const url = new URL(clean(input));
+    if (!isYoutubeHost(url.hostname)) return [];
+    return url.pathname.split('/').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function getYoutubeUsernameOrCustomSlug(input = '') {
+  const parts = getYoutubeUrlPathParts(input);
+  if (!parts.length) return null;
+
+  if (['user', 'c'].includes(parts[0]) && parts[1]) return clean(parts[1]);
+
+  const reserved = new Set([
+    'watch',
+    'shorts',
+    'embed',
+    'live',
+    'playlist',
+    'results',
+    'feed',
+    'hashtag',
+    'channel',
+  ]);
+
+  if (parts[0] && !reserved.has(parts[0]) && !parts[0].startsWith('@')) {
+    return clean(parts[0]);
+  }
+
+  return null;
+}
+
+function isLikelyYoutubeProfileInput(input = '') {
+  const raw = clean(input);
+  if (!raw) return false;
+  if (extractYoutubeVideoId(raw)) return false;
+  if (extractYoutubeChannelId(raw) || extractYoutubeHandle(raw)) return true;
+
+  const parts = getYoutubeUrlPathParts(raw);
+  if (!parts.length) return false;
+
+  return ['channel', 'user', 'c'].includes(parts[0]) || Boolean(getYoutubeUsernameOrCustomSlug(raw));
+}
+
+function youtubeVideoUrlFromId(videoId) {
+  return `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`;
+}
+
+async function fetchYoutubeChannelByParams(paramsObj = {}) {
+  const params = new URLSearchParams({
+    part: 'snippet,contentDetails',
+    ...paramsObj,
+    key: YT_API_KEY,
+  });
+
+  const data = await youtubeApiFetch(`${YT_CHANNELS}?${params.toString()}`);
+  return Array.isArray(data?.items) ? data.items[0] || null : null;
+}
+
+async function fetchYoutubeChannelBySearch(query) {
+  const safeQuery = clean(query);
+  if (!safeQuery) return null;
+
+  const params = new URLSearchParams({
+    part: 'snippet',
+    q: safeQuery,
+    type: 'channel',
+    maxResults: '1',
+    key: YT_API_KEY,
+  });
+
+  const data = await youtubeApiFetch(`${YT_SEARCH}?${params.toString()}`);
+  const channelId = data?.items?.[0]?.id?.channelId || data?.items?.[0]?.snippet?.channelId;
+  return channelId ? fetchYoutubeChannelByParams({ id: channelId }) : null;
+}
+
+async function resolveYoutubeChannelFromInput(input = '') {
+  const raw = clean(input);
+  if (!raw) return null;
+
+  const channelId = extractYoutubeChannelId(raw);
+  if (channelId) return fetchYoutubeChannelByParams({ id: channelId });
+
+  const handle = extractYoutubeHandle(raw);
+  if (handle) return fetchYoutubeChannelByParams({ forHandle: handle });
+
+  const slug = getYoutubeUsernameOrCustomSlug(raw);
+  if (slug) {
+    const byUsername = await fetchYoutubeChannelByParams({ forUsername: slug }).catch(() => null);
+    if (byUsername) return byUsername;
+
+    return fetchYoutubeChannelBySearch(slug);
+  }
+
+  return null;
+}
+
+function pickYoutubeThumbnail(thumbnails = {}) {
+  return (
+    thumbnails?.maxres?.url ||
+    thumbnails?.standard?.url ||
+    thumbnails?.high?.url ||
+    thumbnails?.medium?.url ||
+    thumbnails?.default?.url ||
+    null
+  );
+}
+
+async function fetchLatestVideoFromUploadsPlaylist(uploadsPlaylistId) {
+  const playlistId = clean(uploadsPlaylistId);
+  if (!playlistId) return null;
+
+  const params = new URLSearchParams({
+    part: 'snippet,contentDetails',
+    playlistId,
+    maxResults: '1',
+    key: YT_API_KEY,
+  });
+
+  const data = await youtubeApiFetch(`${YT_PLAYLIST_ITEMS}?${params.toString()}`);
+  const item = Array.isArray(data?.items) ? data.items[0] || null : null;
+  const videoId = item?.contentDetails?.videoId || null;
+  if (!videoId) return null;
+
+  return {
+    videoId,
+    videoUrl: youtubeVideoUrlFromId(videoId),
+    title: item?.snippet?.title || '',
+    publishedAt: item?.contentDetails?.videoPublishedAt || item?.snippet?.publishedAt || null,
+    thumbnailUrl: pickYoutubeThumbnail(item?.snippet?.thumbnails),
+  };
+}
+
+async function resolveYoutubeInsightInput(input = '') {
+  const originalInput = clean(input);
+  const videoId = extractYoutubeVideoId(originalInput);
+
+  if (videoId) {
+    return {
+      originalInput,
+      inputType: 'video',
+      resolvedFromProfile: false,
+      videoId,
+      videoUrl: youtubeVideoUrlFromId(videoId),
+      channel: null,
+      latestVideo: null,
+    };
+  }
+
+  if (!isLikelyYoutubeProfileInput(originalInput)) {
+    return {
+      originalInput,
+      inputType: 'unknown',
+      resolvedFromProfile: false,
+      videoId: null,
+      videoUrl: originalInput,
+      channel: null,
+      latestVideo: null,
+    };
+  }
+
+  const channel = await resolveYoutubeChannelFromInput(originalInput);
+
+  if (!channel) {
+    const err = new Error('YouTube profile/channel not found. Please provide a valid YouTube video link or channel/profile link.');
+    err.status = 404;
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const uploadsPlaylistId = channel?.contentDetails?.relatedPlaylists?.uploads || '';
+  const latestVideo = await fetchLatestVideoFromUploadsPlaylist(uploadsPlaylistId);
+
+  if (!latestVideo?.videoUrl) {
+    const err = new Error('No public latest video found for this YouTube profile/channel.');
+    err.status = 404;
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const snippet = channel?.snippet || {};
+
+  return {
+    originalInput,
+    inputType: 'profile',
+    resolvedFromProfile: true,
+    videoId: latestVideo.videoId,
+    videoUrl: latestVideo.videoUrl,
+    channel: {
+      channelId: channel?.id || null,
+      title: snippet?.title || '',
+      handle: snippet?.customUrl || null,
+      channelUrl: channel?.id ? `https://www.youtube.com/channel/${channel.id}` : originalInput,
+      thumbnailUrl: pickYoutubeThumbnail(snippet?.thumbnails),
+    },
+    latestVideo,
+  };
 }
 
 function canViewAllReports(req = {}) {
@@ -430,10 +783,16 @@ async function analyzeYoutubeVideo(req, res, next) {
       return res.status(400).json({ success: false, message: 'brandId is required for brand Insight OS saved reports.' });
     }
 
+    const resolvedYoutubeInput = await resolveYoutubeInsightInput(videoUrl);
+
     const report = await createInsightReport({
       actor,
       payload: {
-        videoUrl,
+        videoUrl: resolvedYoutubeInput.videoUrl,
+        originalYoutubeInput: resolvedYoutubeInput.originalInput,
+        resolvedFromProfile: resolvedYoutubeInput.resolvedFromProfile,
+        sourceProfile: resolvedYoutubeInput.channel,
+        sourceLatestVideo: resolvedYoutubeInput.latestVideo,
         saveReport: persistReport,
         sourceContext: persistReport ? 'brand_insight_os' : 'public_insight_os',
         brandId,
@@ -457,8 +816,11 @@ async function analyzeYoutubeVideo(req, res, next) {
 
     return res.status(201).json({
       success: true,
-      message: 'YouTube link insight generated successfully.',
+      message: resolvedYoutubeInput.resolvedFromProfile
+        ? 'YouTube profile resolved to latest video and insight generated successfully.'
+        : 'YouTube link insight generated successfully.',
       saved: persistReport,
+      resolvedYoutubeInput,
       data: formattedReport,
       reportId: formattedReport.reportId,
       frontendReport: formattedReport.frontendReport,
@@ -568,22 +930,30 @@ async function refreshYoutubeInsightReportById(req, res, next) {
       existingReport.videoUrl ||
       existingReport.hero?.livePublishedLink ||
       existingReport.videoMetrics?.videoUrl ||
-      existingReport.dashboard?.videoOverview?.videoUrl
+      existingReport.dashboard?.videoOverview?.videoUrl ||
+      existingReport.channelMetrics?.channelUrl ||
+      existingReport.hero?.channelUrl ||
+      existingReport.dashboard?.profile?.channelUrl
     );
 
     if (!videoUrl) {
       return res.status(400).json({
         success: false,
-        message: 'Video URL is missing for this report.'
+        message: 'Video URL or channel URL is missing for this report.'
       });
     }
 
+    const resolvedYoutubeInput = await resolveYoutubeInsightInput(videoUrl);
     const actor = getRequestActor(req);
 
     const refreshedReport = await createInsightReport({
       actor,
       payload: {
-        videoUrl,
+        videoUrl: resolvedYoutubeInput.videoUrl,
+        originalYoutubeInput: resolvedYoutubeInput.originalInput,
+        resolvedFromProfile: resolvedYoutubeInput.resolvedFromProfile,
+        sourceProfile: resolvedYoutubeInput.channel,
+        sourceLatestVideo: resolvedYoutubeInput.latestVideo,
         saveReport: false,
         sourceContext: existingReport.sourceContext || 'brand_insight_os',
         brandId: existingReport.brandId ? String(existingReport.brandId) : getBrandIdFromRequest(req),
@@ -646,7 +1016,10 @@ async function refreshYoutubeInsightReportById(req, res, next) {
 
     return res.status(200).json({
       success: true,
-      message: 'YouTube insight report refreshed successfully.',
+      message: resolvedYoutubeInput.resolvedFromProfile
+        ? 'YouTube profile resolved to latest video and insight report refreshed successfully.'
+        : 'YouTube insight report refreshed successfully.',
+      resolvedYoutubeInput,
       data: formattedReport,
       reportId: formattedReport.reportId,
       frontendReport: formattedReport.frontendReport,
