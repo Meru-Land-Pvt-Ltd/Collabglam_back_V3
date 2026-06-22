@@ -68,6 +68,14 @@ function isQuotaError(status, body) {
 
 const YT_TIMEOUT_MS = Number(process.env.YOUTUBE_TIMEOUT_MS || 12000);
 const RECENT_VIDEO_SAMPLE = Number(process.env.YOUTUBE_RECENT_VIDEO_SAMPLE || 25);
+const DIRECT_CHANNEL_RECENT_VIDEO_SAMPLE = Math.max(
+  1,
+  Math.min(20, Number(process.env.YOUTUBE_CHANNEL_SEARCH_RECENT_VIDEO_SAMPLE || 8))
+);
+const DIRECT_CHANNEL_SEARCH_CONCURRENCY = Math.max(
+  1,
+  Math.min(12, Number(process.env.YOUTUBE_CHANNEL_SEARCH_CONCURRENCY || 8))
+);
 
 // Fetch enough YouTube candidates for discovery.
 // YouTube returns max 50 videos per search page, so we use pageToken pagination.
@@ -170,6 +178,160 @@ function cleanStr(v) {
   return String(v).trim();
 }
 
+
+const COUNTRY_NAME_TO_CODE = {
+  japan: 'JP',
+  jp: 'JP',
+  日本: 'JP',
+  nihon: 'JP',
+  nippon: 'JP',
+  'united states': 'US',
+  usa: 'US',
+  us: 'US',
+  america: 'US',
+  india: 'IN',
+  in: 'IN',
+  'united kingdom': 'GB',
+  uk: 'GB',
+  gb: 'GB',
+};
+
+function normalizeCountryCode(value) {
+  const raw = cleanStr(value);
+  if (!raw) return '';
+  const upper = raw.toUpperCase();
+  if (/^[A-Z]{2}$/.test(upper)) return upper;
+  return COUNTRY_NAME_TO_CODE[raw.toLowerCase()] || upper;
+}
+
+function getLocalizedSearchTerms(baseKeyword, country) {
+  const keyword = cleanStr(baseKeyword);
+  const lower = keyword.toLowerCase();
+  const code = normalizeCountryCode(country);
+  const terms = [];
+
+  if (code === 'JP') {
+    const jpGeneral = [
+      '日本 youtuber',
+      '日本 チャンネル',
+      '日本 レビュー',
+      '日本 商品レビュー',
+      '日本 開封',
+      '日本 比較',
+      '日本 おすすめ',
+    ];
+    terms.push(...jpGeneral);
+
+    if (/beauty|makeup|skin|cosmetic|fashion|style/.test(lower)) {
+      terms.push(
+        '美容 youtuber',
+        '美容系 youtuber',
+        'メイク youtuber',
+        'コスメ レビュー',
+        'コスメ 購入品',
+        'スキンケア レビュー',
+        'ヘアメイク',
+        'ファッション youtuber',
+        'プチプラ コスメ',
+        '韓国コスメ レビュー',
+        'grwm 日本',
+        'makeup japan',
+        'japanese beauty youtuber',
+        'japanese makeup review'
+      );
+    }
+
+    if (/tech|phone|gadget|camera|drone|action|computer|laptop|review/.test(lower)) {
+      terms.push(
+        'ガジェット レビュー',
+        'スマホ レビュー',
+        'テック youtuber',
+        'カメラ レビュー',
+        'ドローン レビュー',
+        'アクションカメラ レビュー',
+        'パソコン レビュー',
+        '家電 レビュー',
+        'japan tech review',
+        'japanese gadget review'
+      );
+    }
+
+    if (/pool|cleaner|home|garden|vacuum|lawn/.test(lower)) {
+      terms.push(
+        '家電 レビュー',
+        '掃除機 レビュー',
+        'ロボット掃除機 レビュー',
+        'スマートホーム レビュー',
+        '家庭用品 レビュー',
+        '暮らし youtuber'
+      );
+    }
+
+    if (keyword) {
+      terms.push(
+        `${keyword} 日本`,
+        `${keyword} jp`,
+        `${keyword} japan`,
+        `${keyword} レビュー`,
+        `${keyword} 開封`,
+        `${keyword} 比較`,
+        `${keyword} おすすめ`
+      );
+    }
+  }
+
+  return terms;
+}
+
+function toBooleanFlag(value, defaultValue = false) {
+  if (value === null || typeof value === 'undefined' || value === '') return defaultValue;
+  const raw = cleanStr(value).toLowerCase();
+  if (['true', '1', 'yes', 'y', 'on'].includes(raw)) return true;
+  if (['false', '0', 'no', 'n', 'off'].includes(raw)) return false;
+  return defaultValue;
+}
+
+function normalizeBrowseSearchMode(value) {
+  const raw = cleanStr(value).toLowerCase();
+  if (['script', 'script_search', 'script-search', 'app_script', 'app-script', 'apps_script', 'apps-script'].includes(raw)) {
+    return 'script';
+  }
+  return 'channel';
+}
+
+function resolveBrowseSearchMode(q = {}) {
+  const source = cleanStr(q.source).toLowerCase();
+
+  const scriptRequested =
+    normalizeBrowseSearchMode(q.searchMode || q.mode) === 'script' ||
+    ['app_script', 'apps_script', 'script', 'script_search'].includes(source) ||
+    toBooleanFlag(q.useScript, false) ||
+    toBooleanFlag(q.scriptSearch, false);
+
+  const channelRequested =
+    normalizeBrowseSearchMode(q.searchMode || q.mode) === 'channel' ||
+    ['youtube_api', 'youtube', 'channel', 'channel_search'].includes(source) ||
+    toBooleanFlag(q.channelSearch, false) ||
+    toBooleanFlag(q.skipScript, false) ||
+    toBooleanFlag(q.skipAppsScript, false);
+
+  if (scriptRequested && !channelRequested) return 'script';
+  if (scriptRequested && channelRequested) {
+    return toBooleanFlag(q.useScript, false) || toBooleanFlag(q.scriptSearch, false)
+      ? 'script'
+      : 'channel';
+  }
+
+  return normalizeBrowseSearchMode(q.searchMode || q.mode || q.source);
+}
+
+function shouldRunBrowseScriptAnalysis(q = {}, searchMode = 'channel') {
+  if (searchMode !== 'script') return false;
+  if (toBooleanFlag(q.skipScript, false) || toBooleanFlag(q.skipAppsScript, false)) return false;
+  return true;
+}
+
+
 function toNum(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
@@ -215,6 +377,26 @@ function chunkArray(arr = [], size = 50) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
+}
+
+
+async function mapWithConcurrency(items = [], concurrency = 6, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  const workers = Array.from(
+    { length: Math.max(1, Math.min(concurrency, items.length || 1)) },
+    async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await mapper(items[index], index);
+      }
+    }
+  );
+
+  await Promise.all(workers);
+  return results;
 }
 
 function daysBetween(a, b) {
@@ -301,13 +483,39 @@ function detectLanguage(text = '') {
 
 function estimateAudienceCountry(channelCountry, text = '') {
   const country = cleanStr(channelCountry).toUpperCase();
-  const hay = String(text || '').toLowerCase();
+  const rawText = String(text || '');
+  const hay = rawText.toLowerCase();
 
   if (country) {
     return { estimatedAudienceCountry: country, audienceCountryConfidence: 75 };
   }
 
+  // YouTube often leaves snippet.country empty, especially for Japanese creators.
+  // When the selected region is JP, Japanese titles/descriptions must still count as Japan.
+  // Without this, strict Japan searches keep only the rare channels that expose country=JP,
+  // which is why the queue stopped around 2 creators even with target=50.
+  const hasJapaneseScript = /[぀-ヿ㐀-䶿一-鿿]/.test(rawText);
+
   const signalMap = {
+    JP: [
+      'japan',
+      'japanese',
+      'tokyo',
+      'osaka',
+      '日本',
+      '日本語',
+      '東京',
+      '大阪',
+      'メイク',
+      '美容',
+      'コスメ',
+      'レビュー',
+      '購入品',
+      '開封',
+      'おすすめ',
+      'チャンネル',
+      'youtuber',
+    ],
     IN: ['india', 'hindi', 'rupees', '₹', 'flipkart', 'myntra', 'zomato', 'swiggy', 'upi', 'paytm', 'zerodha', 'upstox', 'delhi', 'mumbai', 'bangalore', 'bengaluru'],
     US: ['usa', 'united states', 'dollar', '$', 'walmart', 'best buy', 'target'],
     GB: ['uk', 'united kingdom', 'london', 'pound', '£'],
@@ -315,7 +523,10 @@ function estimateAudienceCountry(channelCountry, text = '') {
   };
 
   const scored = Object.entries(signalMap)
-    .map(([code, signals]) => ({ code, score: signals.reduce((n, s) => n + (hay.includes(s) ? 1 : 0), 0) }))
+    .map(([code, signals]) => ({
+      code,
+      score: signals.reduce((n, s) => n + (hay.includes(String(s).toLowerCase()) ? 1 : 0), 0) + (code === 'JP' && hasJapaneseScript ? 3 : 0),
+    }))
     .sort((a, b) => b.score - a.score)[0];
 
   if (!scored || scored.score === 0) return { estimatedAudienceCountry: '', audienceCountryConfidence: 0 };
@@ -713,11 +924,11 @@ function calculateNicheFit(doc, campaignKeyword) {
 }
 
 function getCountryMatch(doc, targetCountry) {
-  const target = cleanStr(targetCountry).toUpperCase();
+  const target = normalizeCountryCode(targetCountry);
   if (!target) return 'Unknown';
 
-  const channelCountry = cleanStr(doc.country).toUpperCase();
-  const estimatedCountry = cleanStr(doc.estimatedAudienceCountry).toUpperCase();
+  const channelCountry = normalizeCountryCode(doc.country);
+  const estimatedCountry = normalizeCountryCode(doc.estimatedAudienceCountry);
   if (channelCountry === target || estimatedCountry === target) return 'Yes';
   if (!channelCountry && !estimatedCountry) return 'Unknown';
   return 'No';
@@ -958,7 +1169,7 @@ function buildRequestCampaignDetails(q = {}) {
 function buildCampaignSearchQueries(campaignDetails = {}) {
   const product = cleanStr(campaignDetails.productName);
   const niche = cleanStr(campaignDetails.campaignNiche);
-  const country = cleanStr(campaignDetails.targetCountry).toUpperCase();
+  const country = normalizeCountryCode(campaignDetails.targetCountry);
   const baseKeyword = product || niche;
   const recommendationQueries = Array.isArray(campaignDetails.recommendationSearchQueries)
     ? campaignDetails.recommendationSearchQueries
@@ -967,6 +1178,8 @@ function buildCampaignSearchQueries(campaignDetails = {}) {
   const querySeeds = [
     ...recommendationQueries,
     ...campaignDetails.keywords,
+    ...getLocalizedSearchTerms(baseKeyword, country),
+    ...getLocalizedSearchTerms(niche, country),
     baseKeyword,
     product,
     niche,
@@ -1049,7 +1262,7 @@ async function searchVideoCreatorChannels(
       order: 'relevance',
     });
 
-    const regionCode = cleanStr(targetCountry).toUpperCase();
+    const regionCode = normalizeCountryCode(targetCountry);
     if (/^[A-Z]{2}$/.test(regionCode)) params.set('regionCode', regionCode);
     if (pageToken) params.set('pageToken', pageToken);
 
@@ -1066,6 +1279,58 @@ async function searchVideoCreatorChannels(
         sourceVideoUrl: item?.id?.videoId ? `https://www.youtube.com/watch?v=${item.id.videoId}` : '',
         foundViaQuery: query,
         requestedCategory: cleanStr(requestedCategory) || query,
+      });
+
+      if (map.size >= targetLimit) break;
+    }
+
+    if (map.size >= targetLimit) break;
+    pageToken = data?.nextPageToken || '';
+    if (!pageToken) break;
+  }
+
+  return Array.from(map.values()).slice(0, targetLimit);
+}
+
+
+async function searchYouTubeChannelsByKeyword(
+  query,
+  maxResults = 50,
+  targetLimit = 50,
+  targetCountry = ''
+) {
+  const cleanQuery = cleanStr(query);
+  if (!cleanQuery) return [];
+
+  const map = new Map();
+  let pageToken = '';
+
+  for (let page = 0; page < 3; page += 1) {
+    const params = new URLSearchParams({
+      part: 'snippet',
+      q: cleanQuery,
+      type: 'channel',
+      maxResults: String(Math.min(50, Math.max(1, maxResults))),
+      order: 'relevance',
+    });
+
+    const regionCode = normalizeCountryCode(targetCountry);
+    if (/^[A-Z]{2}$/.test(regionCode)) params.set('regionCode', regionCode);
+    if (pageToken) params.set('pageToken', pageToken);
+
+    const data = await ytFetch(YT_SEARCH, params);
+
+    for (const item of Array.isArray(data?.items) ? data.items : []) {
+      const channelId = item?.id?.channelId || item?.snippet?.channelId;
+      if (!channelId || map.has(channelId)) continue;
+
+      map.set(channelId, {
+        channelId,
+        channelName: cleanStr(item?.snippet?.title),
+        sourceVideoTitle: '',
+        sourceVideoUrl: '',
+        foundViaQuery: cleanQuery,
+        requestedCategory: cleanQuery,
       });
 
       if (map.size >= targetLimit) break;
@@ -1270,7 +1535,7 @@ function passesCampaignRules(doc, campaignDetails = {}) {
   const minSubscribers = campaignDetails.minSubscribers;
   const maxSubscribers = campaignDetails.maxSubscribers;
   const minAvgViews = campaignDetails.minAvgViews;
-  const targetCountry = cleanStr(campaignDetails.targetCountry).toUpperCase();
+  const targetCountry = normalizeCountryCode(campaignDetails.targetCountry);
   const strictFilters = Boolean(campaignDetails.strictFilters);
   const strictCountry = Boolean(campaignDetails.strictCountry);
   const strictTier = Boolean(campaignDetails.strictTier);
@@ -1285,10 +1550,14 @@ function passesCampaignRules(doc, campaignDetails = {}) {
 
   if (minAvgViews != null && doc.avgViews < minAvgViews) return false;
 
-  // Country is a hard filter when selected. Use actual YouTube channel country only.
-  if (strictCountry && targetCountry) {
-    const channelCountry = cleanStr(doc.country).toUpperCase();
-    if (channelCountry !== targetCountry) return false;
+  // When a country is selected for script discovery, keep results from that country only.
+  // Use both YouTube channel country and estimated audience country so valid JP creators
+  // are not dropped when YouTube does not expose snippet.country.
+  const requireCountry = Boolean(campaignDetails.requireCountry || strictCountry);
+  if (requireCountry && targetCountry) {
+    const channelCountry = normalizeCountryCode(doc.country);
+    const estimatedCountry = normalizeCountryCode(doc.estimatedAudienceCountry);
+    if (channelCountry !== targetCountry && estimatedCountry !== targetCountry) return false;
   }
 
   if (strictTier || strictFilters) {
@@ -1498,9 +1767,8 @@ function buildMongoFilter({
   }
 
   if (country) {
-    const c = country.toUpperCase();
-    // Country filter is exact: only creators whose actual YouTube channel country matches.
-    and.push({ country: c });
+    const c = normalizeCountryCode(country);
+    and.push({ $or: [{ country: c }, { estimatedAudienceCountry: c }] });
   }
 
   if (strictFilters && (minSubscribers != null || maxSubscribers != null)) {
@@ -1543,11 +1811,12 @@ function isSubscriberTierMatch(subscribers, minSubscribers, maxSubscribers) {
 }
 
 function isCountryMatchForFilter(doc, country) {
-  const target = cleanStr(country).toUpperCase();
+  const target = normalizeCountryCode(country);
   if (!target) return true;
 
-  const channelCountry = cleanStr(doc.country).toUpperCase();
-  return channelCountry === target;
+  const channelCountry = normalizeCountryCode(doc.country);
+  const estimatedCountry = normalizeCountryCode(doc.estimatedAudienceCountry);
+  return channelCountry === target || estimatedCountry === target;
 }
 
 function creatorListDTO(doc, context = {}) {
@@ -1731,10 +2000,33 @@ async function getYouTubeDiscoveryJob(req, res) {
   return res.status(200).json(buildJobResponse(job));
 }
 
-function shouldUseIncrementalMode(_q = {}) {
-  // Incremental 5-row streaming is disabled. Browse and invitation now return
-  // one accurate response: 25 minimum for invite, 50 for Browse.
-  return false;
+function shouldUseIncrementalMode(q = {}) {
+  const wantsQueue =
+    toBooleanFlag(q.queue, false) ||
+    toBooleanFlag(q.incremental, false) ||
+    toBooleanFlag(q.nonBlocking, false) ||
+    toBooleanFlag(q.background, false) ||
+    toBooleanFlag(q.forceBackground, false) ||
+    toBooleanFlag(q.recommendationQueue, false) ||
+    toBooleanFlag(q.queueRecommendation, false);
+
+  if (!wantsQueue) return false;
+
+  // Campaign recommendation API can also use the same non-blocking queue.
+  // It is independent of Browse Influencer's Channel/Script selector.
+  if (
+    toBooleanFlag(q.recommendationQueue, false) ||
+    toBooleanFlag(q.queueRecommendation, false) ||
+    cleanStr(q.type) === 'campaign-recommendation'
+  ) {
+    return true;
+  }
+
+  const searchMode = resolveBrowseSearchMode(q);
+  if (searchMode !== 'script') return false;
+
+  // Browse Influencer script search should not block until all creators finish.
+  return true;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1760,6 +2052,7 @@ async function startBrowseIncrementalJob({
   minimumResults,
   sort,
   shouldRefresh,
+  runScriptAnalysis = false,
 }) {
   const q = { ...req.query, ...req.body };
   const batchSize = Math.max(1, toIntOrNull(q.batchSize) || DISCOVERY_BATCH_SIZE);
@@ -1777,7 +2070,8 @@ async function startBrowseIncrementalJob({
       minSubscribers,
       maxSubscribers,
       strictCountry,
-      source: 'browse-influencer',
+      source: 'browse-influencer-script-queue',
+      scriptExecuted: Boolean(runScriptAnalysis),
     },
   });
 
@@ -1786,11 +2080,14 @@ async function startBrowseIncrementalJob({
       ? creatorOrDoc
       : creatorListDTO(creatorOrDoc, context);
 
+    // When the user selects a country in Browse Influencer, only show creators from that country.
+    // This keeps searches like Japan as Japan-only while the backend keeps discovering until 50.
     if (country && !isCountryMatchForFilter(creator, country)) return false;
 
-    return addCreatorToDiscoveryJob(job, creator, (items) =>
-      sortDiscoveryDataForSelectedFilters(items, context)
-    );
+    // Keep incremental results in the same order they are discovered.
+    // The frontend appends new rows top-to-bottom, so we avoid re-sorting
+    // the queue on every new creator and prevent rows from jumping around.
+    return addCreatorToDiscoveryJob(job, creator);
   };
 
   startDiscoveryJob(job, async () => {
@@ -1811,19 +2108,56 @@ async function startBrowseIncrementalJob({
         ...campaignDetails,
         campaignNiche: category || campaignDetails.campaignNiche || keyword,
         productName: campaignDetails.productName || keyword,
+        // Country search must stay country-only. Send regionCode and require matching country.
         targetCountry: country,
+        requireCountry: Boolean(country),
         minSubscribers: null,
         maxSubscribers: null,
         minAvgViews,
         strictFilters,
         strictCountry,
         targetSaveCount: Math.min(50, Math.max(limit, minimumResults)),
-        rawChannelLimit: Math.min(120, Math.max(limit * 2, minimumResults * 2, 60)),
+        rawChannelLimit: country ? Math.min(300, Math.max(limit * 6, minimumResults * 6, 220)) : Math.min(120, Math.max(limit * 2, minimumResults * 2, 60)),
         recentVideoSample: 8,
-        maxSearchQueries: 8,
-        searchResultsPerQuery: 25,
+        maxSearchQueries: country ? 18 : 8,
+        searchResultsPerQuery: country ? 50 : 25,
         maxDiscoveryMs: 285000,
-        skipOpenAIAnalysis: true,
+        // Script search queue should run the script/intelligence layer. Channel search never reaches this branch.
+        skipOpenAIAnalysis: !runScriptAnalysis,
+        searchMode: 'script',
+        source: 'app_script',
+        keywords: Array.from(new Set([...(campaignDetails.keywords || []), keyword, category].filter(Boolean))),
+        onCreatorSaved: async ({ doc }) => {
+          addBrowseCreator(doc);
+          return job.data.length < limit;
+        },
+      });
+    }
+
+    // If the first pass produced too few creators, run broader keyword passes but keep
+    // the selected country as a hard requirement. For example Japan search fills with
+    // more Japan creators, not creators from other countries.
+    if (job.data.length < Math.min(limit, minimumResults)) {
+      await refreshChannelsForCampaign({
+        ...campaignDetails,
+        campaignNiche: category || campaignDetails.campaignNiche || keyword,
+        productName: campaignDetails.productName || keyword,
+        targetCountry: country,
+        requireCountry: Boolean(country),
+        minSubscribers: null,
+        maxSubscribers: null,
+        minAvgViews: null,
+        strictFilters: false,
+        strictCountry: Boolean(country),
+        targetSaveCount: Math.min(50, Math.max(limit, minimumResults)),
+        rawChannelLimit: Math.min(360, Math.max(limit * 8, minimumResults * 8, 250)),
+        recentVideoSample: 8,
+        maxSearchQueries: country ? 20 : 10,
+        searchResultsPerQuery: 50,
+        maxDiscoveryMs: 285000,
+        skipOpenAIAnalysis: !runScriptAnalysis,
+        searchMode: 'script',
+        source: 'app_script',
         keywords: Array.from(new Set([...(campaignDetails.keywords || []), keyword, category].filter(Boolean))),
         onCreatorSaved: async ({ doc }) => {
           addBrowseCreator(doc);
@@ -1845,6 +2179,12 @@ async function startBrowseIncrementalJob({
 
   return res.status(202).json(buildJobResponse(job, {
     campaignId,
+    searchMode: 'script',
+    source: 'app_script',
+    scriptSearch: true,
+    channelSearch: false,
+    scriptExecuted: Boolean(runScriptAnalysis),
+    skipScript: false,
     refreshedCount: 0,
     activityLookbackDays: CREATOR_LOOKBACK_DAYS,
     activityLookbackStartDate: getCreatorLookbackStartDate(),
@@ -1860,10 +2200,200 @@ async function startBrowseIncrementalJob({
   }));
 }
 
+
+async function runDirectChannelSearch({
+  keyword,
+  campaignDetails,
+  campaignId,
+  category,
+  country,
+  minSubscribers,
+  maxSubscribers,
+  minAvgViews,
+  strictFilters,
+  limit,
+  sort,
+  context,
+}) {
+  const query = cleanStr(keyword || category || campaignDetails?.productName || campaignDetails?.campaignNiche);
+  if (!query) return { data: [], refreshedCount: 0 };
+
+  const targetCountry = normalizeCountryCode(country);
+  const targetLimit = Math.max(50, Number(limit || 50));
+  const maxCandidateRows = targetCountry ? Math.min(500, Math.max(targetLimit * 10, 250)) : Math.max(50, targetLimit);
+
+  // Channel search must remain YouTube API only, but selected country must be strict.
+  // For JP and similar regions, YouTube channel search with a generic English query often
+  // returns global channels. Use regionCode plus localized country-specific queries, then
+  // keep only channels whose YouTube country or estimated audience country matches.
+  const channelSearchQueries = Array.from(new Set([
+    query,
+    category,
+    ...getLocalizedSearchTerms(query, targetCountry),
+    ...getLocalizedSearchTerms(category, targetCountry),
+    targetCountry ? `${query} ${targetCountry}` : '',
+    targetCountry ? `${query} ${country}` : '',
+  ].map(cleanStr).filter(Boolean))).slice(0, targetCountry ? 18 : 1);
+
+  const discoveryMap = new Map();
+  for (const searchQuery of channelSearchQueries) {
+    if (discoveryMap.size >= maxCandidateRows) break;
+
+    const rows = await searchYouTubeChannelsByKeyword(
+      searchQuery,
+      50,
+      Math.min(120, maxCandidateRows - discoveryMap.size),
+      targetCountry
+    );
+
+    for (const row of rows) {
+      if (!row?.channelId || discoveryMap.has(row.channelId)) continue;
+      discoveryMap.set(row.channelId, {
+        ...row,
+        foundViaQuery: row.foundViaQuery || searchQuery,
+        requestedCategory: row.requestedCategory || category || query,
+      });
+      if (discoveryMap.size >= maxCandidateRows) break;
+    }
+  }
+
+  const channelIds = Array.from(discoveryMap.keys());
+  if (!channelIds.length) return { data: [], refreshedCount: 0 };
+
+  const channels = await fetchChannelsByIds(channelIds);
+  const candidateChannels = [];
+
+  for (const channel of channels) {
+    const snippet = channel?.snippet || {};
+    const branding = channel?.brandingSettings?.channel || {};
+    const channelText = [snippet.title, snippet.description, branding.keywords].join('\n');
+    const estimate = estimateAudienceCountry(snippet.country, channelText);
+
+    if (targetCountry) {
+      const channelCountry = normalizeCountryCode(snippet.country);
+      const estimatedCountry = normalizeCountryCode(estimate.estimatedAudienceCountry);
+
+      // Country filter is strict for direct channel search. Do not show global
+      // channels when the user requested Japan/JP. If YouTube does not expose
+      // country, accept strong language/text signals such as Japanese script.
+      if (channelCountry && channelCountry !== targetCountry) continue;
+      if (!channelCountry && estimatedCountry !== targetCountry) continue;
+    }
+
+    candidateChannels.push(channel);
+    if (candidateChannels.length >= targetLimit * 2) break;
+  }
+
+  let refreshedCount = 0;
+  const docs = [];
+
+  for (const channel of candidateChannels) {
+    if (docs.length >= targetLimit) break;
+
+    const discoveryInfo = discoveryMap.get(channel.id) || {};
+    const uploadsPlaylistId = channel?.contentDetails?.relatedPlaylists?.uploads || null;
+
+    let videos = [];
+    try {
+      // Still YouTube API only: playlistItems + videos.list. No Apps Script and no OpenAI.
+      videos = await fetchRecentVideos(uploadsPlaylistId, DIRECT_CHANNEL_RECENT_VIDEO_SAMPLE);
+    } catch (_) {
+      videos = [];
+    }
+
+    const doc = buildCreatorDoc(
+      channel,
+      videos,
+      {
+        ...campaignDetails,
+        campaignId,
+        campaignNiche: category || campaignDetails?.campaignNiche || query,
+        productName: campaignDetails?.productName || query,
+        targetCountry,
+        minSubscribers,
+        maxSubscribers,
+        minAvgViews,
+        strictFilters: false,
+        strictCountry: Boolean(targetCountry),
+        requireCountry: Boolean(targetCountry),
+        skipOpenAIAnalysis: true,
+        searchMode: 'channel',
+        source: 'youtube_api',
+        keywords: channelSearchQueries,
+      },
+      discoveryInfo,
+      channelSearchQueries
+    );
+
+    if (targetCountry && !isCountryMatchForFilter(doc, targetCountry)) continue;
+
+    // Channel search is intentionally lightweight: YouTube Data API only,
+    // no Apps Script-style intelligence flow and no OpenAI analysis.
+    doc.searchMode = 'channel';
+    doc.source = 'youtube_api';
+    doc.profileSource = 'youtube_api';
+    doc.scriptExecuted = false;
+    doc.skipScript = true;
+    doc.skipAppsScript = true;
+
+    const campaignContext = doc.campaignContext;
+    delete doc.campaignContext;
+
+    try {
+      await YouTubeData.updateOne(
+        { channelId: doc.channelId },
+        {
+          $set: doc,
+          $addToSet: { campaignContexts: campaignContext },
+        },
+        { upsert: true }
+      );
+      refreshedCount += 1;
+    } catch (_) {}
+
+    docs.push(doc);
+  }
+
+  const data = sortDiscoveryDataForSelectedFilters(
+    docs.map((doc) => creatorListDTO(doc, context)),
+    context
+  ).slice(0, targetLimit);
+
+  return { data, refreshedCount };
+}
+
 async function browseCreators(req, res) {
   try {
     const q = { ...req.query, ...req.body };
+    const queuedJobId = cleanStr(q.jobId);
+
+    if (queuedJobId) {
+      const job = discoveryJobs.get(queuedJobId);
+
+      if (!job) {
+        return res.status(404).json({
+          success: false,
+          error: 'Discovery job not found or expired',
+        });
+      }
+
+      return res.status(200).json(buildJobResponse(job, {
+        pagination: {
+          page: 1,
+          limit: job.limit,
+          total: getVisibleJobData(job).length,
+          totalPages: 1,
+          hasNextPage: false,
+          hasPrevPage: false,
+          frontendPagination: true,
+        },
+      }));
+    }
+
     const campaignId = cleanStr(q.campaignId);
+    const searchMode = resolveBrowseSearchMode(q);
+    const runScriptAnalysis = shouldRunBrowseScriptAnalysis(q, searchMode);
+    const isChannelSearch = searchMode === 'channel';
 
     let campaignDetails = campaignId ? await getCampaignDetailsById(campaignId) : buildRequestCampaignDetails(q);
     const tierRange = getSubscriberTierRange(q.subscriberTier);
@@ -1871,7 +2401,9 @@ async function browseCreators(req, res) {
     const category = requestedCategory || cleanStr(campaignDetails?.campaignNiche);
     const keyword = cleanStr(q.keyword || q.search) || cleanStr(campaignDetails?.productName) || cleanStr(campaignDetails?.campaignNiche);
     const country = cleanStr(q.country) || cleanStr(campaignDetails?.targetCountry);
-    const strictCountry = Boolean(country);
+    // Browse page country should prioritize exact matches but must not cap results to 1-2.
+    // Use a hard country filter only when the frontend explicitly sends strictCountry=true.
+    const strictCountry = String(q.strictCountry ?? 'false').toLowerCase() === 'true';
     const minSubscribers = toIntOrNull(q.minSubscribers) ?? tierRange?.min ?? campaignDetails?.minSubscribers ?? null;
     const maxSubscribers = toIntOrNull(q.maxSubscribers) ?? tierRange?.max ?? campaignDetails?.maxSubscribers ?? null;
     const minAvgViews = toIntOrNull(q.minAvgViews) ?? campaignDetails?.minAvgViews ?? null;
@@ -1891,7 +2423,10 @@ async function browseCreators(req, res) {
 
     let liveError = null;
     let refreshedCount = 0;
-    const fastMode = String(q.fast ?? 'true').toLowerCase() !== 'false' || frontendPagination;
+    const requestedFastMode = String(q.fast ?? 'true').toLowerCase() !== 'false' || frontendPagination;
+    // Channel search should stay fast and use only YouTube API data.
+    // Script search intentionally runs the Apps Script-style intelligence layer.
+    const fastMode = isChannelSearch ? requestedFastMode : false;
     const minimumResults = Math.min(50, Math.max(25, toIntOrNull(q.minimumResults) || 25));
     let shouldRefresh = Boolean(campaignId) || Boolean(cleanStr(q.keyword || q.search)) || Boolean(requestedCategory);
 
@@ -1899,7 +2434,7 @@ async function browseCreators(req, res) {
 
     const filter = buildMongoFilter({
       keyword: cleanStr(q.keyword || q.search),
-      country,
+      country: strictCountry ? country : '',
       minSubscribers,
       maxSubscribers,
       minAvgViews,
@@ -1919,7 +2454,56 @@ async function browseCreators(req, res) {
       maxSubscribers,
       subscriberTier: q.subscriberTier,
       strictFilters,
+      searchMode,
+      source: isChannelSearch ? 'youtube_api' : 'app_script',
+      skipOpenAIAnalysis: !runScriptAnalysis,
     };
+
+    const directChannelSearch =
+      isChannelSearch &&
+      (toBooleanFlag(q.directChannelSearch, true) || toBooleanFlag(q.channelSearch, false)) &&
+      Boolean(cleanStr(q.keyword || q.search));
+
+    if (directChannelSearch) {
+      const directResult = await runDirectChannelSearch({
+        keyword: cleanStr(q.keyword || q.search),
+        campaignDetails,
+        campaignId,
+        category,
+        country,
+        minSubscribers,
+        maxSubscribers,
+        minAvgViews,
+        strictFilters,
+        limit: mongoLimit,
+        sort,
+        context,
+      });
+
+      return res.status(200).json({
+        success: true,
+        searchMode: 'channel',
+        source: 'youtube_api',
+        channelSearch: true,
+        scriptSearch: false,
+        scriptExecuted: false,
+        skipScript: true,
+        skipAppsScript: true,
+        refreshedCount: directResult.refreshedCount,
+        activityLookbackDays: CREATOR_LOOKBACK_DAYS,
+        activityLookbackStartDate: activeSinceDate,
+        data: directResult.data,
+        pagination: {
+          page: 1,
+          limit,
+          total: directResult.data.length,
+          totalPages: 1,
+          hasNextPage: false,
+          hasPrevPage: false,
+          frontendPagination: true,
+        },
+      });
+    }
 
     if (shouldUseIncrementalMode(q)) {
       return startBrowseIncrementalJob({
@@ -1941,6 +2525,7 @@ async function browseCreators(req, res) {
         minimumResults,
         sort,
         shouldRefresh,
+        runScriptAnalysis,
       });
     }
 
@@ -1959,7 +2544,9 @@ async function browseCreators(req, res) {
           ...campaignDetails,
           campaignNiche: requestedCategory || campaignDetails.campaignNiche || keyword,
           productName: campaignDetails.productName || keyword,
-          targetCountry: country,
+          // Keep country as a ranking/context signal, not a hard YouTube regionCode,
+          // unless strictCountry=true is explicitly requested.
+          targetCountry: strictCountry ? country : '',
           minSubscribers: fastMode ? null : minSubscribers,
           maxSubscribers: fastMode ? null : maxSubscribers,
           minAvgViews,
@@ -1973,7 +2560,11 @@ async function browseCreators(req, res) {
           maxSearchQueries: fastMode ? 6 : undefined,
           searchResultsPerQuery: fastMode ? 20 : undefined,
           maxDiscoveryMs: fastMode ? 240000 : undefined,
-          skipOpenAIAnalysis: fastMode,
+          // Channel search: no Apps Script/OpenAI analysis, only YouTube API discovery.
+          // Script search: run the Apps Script-style intelligence layer.
+          skipOpenAIAnalysis: !runScriptAnalysis,
+          searchMode,
+          source: isChannelSearch ? 'youtube_api' : 'app_script',
           keywords: Array.from(new Set([...(campaignDetails.keywords || []), keyword, requestedCategory].filter(Boolean))),
         });
       } catch (err) {
@@ -1999,6 +2590,10 @@ async function browseCreators(req, res) {
 
     return res.status(200).json({
       success: true,
+      searchMode,
+      source: isChannelSearch ? 'youtube_api' : 'app_script',
+      scriptExecuted: runScriptAnalysis && shouldRefresh,
+      skipScript: !runScriptAnalysis,
       refreshedCount,
       activityLookbackDays: CREATOR_LOOKBACK_DAYS,
       activityLookbackStartDate: activeSinceDate,
@@ -2487,12 +3082,12 @@ function creatorMatchesRecommendationRelevance(creator, campaignDetails = {}) {
 }
 
 function splitCreatorsByRecommendationFit(creators = [], campaignDetails = {}, context = {}) {
-  const targetCountry = cleanStr(context.country || campaignDetails.targetCountry).toUpperCase();
+  const targetCountry = normalizeCountryCode(context.country || campaignDetails.targetCountry);
   const hasCountry = Boolean(targetCountry);
   const hasTier = context.minSubscribers != null || context.maxSubscribers != null;
 
   const enriched = creators.map((creator) => {
-    const countryMatch = !hasCountry || cleanStr(creator.country).toUpperCase() === targetCountry;
+    const countryMatch = !hasCountry || isCountryMatchForFilter(creator, targetCountry);
     const tierMatch = !hasTier || isSubscriberTierMatch(creator.subscribers || creator.subscriberCount, context.minSubscribers, context.maxSubscribers);
     const relevanceMatch = creatorMatchesRecommendationRelevance(creator, campaignDetails);
     const recommendationScore = Number(creator.recommendationMatchScore || creator.scores?.recommendationMatchScore || 0);
@@ -2763,7 +3358,8 @@ async function startCampaignRecommendationIncrementalJob({
   save,
   forceRefresh,
 }) {
-  const batchSize = Math.max(1, toIntOrNull(req.body.batchSize) || toIntOrNull(req.query.batchSize) || DISCOVERY_BATCH_SIZE);
+  // Recommendation queue should reveal creators one by one.
+  const batchSize = Math.max(1, toIntOrNull(req.body.batchSize) || toIntOrNull(req.query.batchSize) || 1);
   const job = createDiscoveryJob({
     type: 'campaign-recommendation',
     target: minimumInfluencers,
@@ -2799,7 +3395,8 @@ async function startCampaignRecommendationIncrementalJob({
     if (hardCountry && !candidate.filterMatch?.countryMatch) return false;
     if (!candidate.filterMatch?.campaignCategoryMatch) return false;
 
-    return addCreatorToDiscoveryJob(job, candidate, sortRecommendedCreators);
+    // Keep insertion order so the frontend fills top-to-bottom without rows jumping.
+    return addCreatorToDiscoveryJob(job, candidate);
   };
 
   startDiscoveryJob(job, async () => {
@@ -2861,24 +3458,30 @@ async function startCampaignRecommendationIncrementalJob({
 
     // Final DB fill pass: pull saved YouTubeData rows that match current campaign context.
     const activeSinceDate = getCreatorLookbackStartDate();
-    const loadCreators = async ({ useKeyword = true, useCategory = true, useCountry = true }) => {
+    const loadCreators = async ({
+      useKeyword = true,
+      useCategory = true,
+      useCountry = true,
+      useCampaign = true,
+      useActiveSince = true,
+    }) => {
       const filter = buildMongoFilter({
         keyword: useKeyword ? keyword : '',
         country: useCountry && hardCountry ? country : '',
-        minSubscribers: requestedTierRange.minSubscribers,
-        maxSubscribers: requestedTierRange.maxSubscribers,
+        minSubscribers: null,
+        maxSubscribers: null,
         minAvgViews: null,
         minEngagement: null,
         category: useCategory ? category : '',
-        campaignId,
+        campaignId: useCampaign ? campaignId : '',
         includeExcluded: false,
-        strictFilters: true,
-        activeSinceDate,
+        strictFilters: false,
+        activeSinceDate: useActiveSince ? activeSinceDate : null,
       });
 
       const docs = await YouTubeData.find(filter)
         .sort(SORT_MAP.relevance)
-        .limit(Math.min(50, Math.max(limit * 2, minimumInfluencers * 2, 40)))
+        .limit(Math.max(limit * 3, minimumInfluencers * 3, 150))
         .lean();
 
       return sortDiscoveryDataForSelectedFilters(
@@ -2887,21 +3490,35 @@ async function startCampaignRecommendationIncrementalJob({
       );
     };
 
-    const pools = [
-      await loadCreators({ useKeyword: true, useCategory: true, useCountry: Boolean(country) }),
-      await loadCreators({ useKeyword: false, useCategory: true, useCountry: Boolean(country) }),
-    ];
-
-    if (!hardCountry) {
-      pools.push(await loadCreators({ useKeyword: false, useCategory: true, useCountry: false }));
-    }
-
-    for (const pool of pools) {
-      for (const creator of pool) {
+    const addPool = async (opts) => {
+      if (job.data.length >= limit) return;
+      const rows = await loadCreators(opts);
+      for (const creator of rows) {
         addRecommendationCreator(creator);
         if (job.data.length >= limit) break;
       }
-      if (job.data.length >= limit) break;
+    };
+
+    await addPool({ useKeyword: true, useCategory: true, useCountry: Boolean(country), useCampaign: true });
+
+    if (job.data.length < minimumInfluencers) {
+      await addPool({ useKeyword: false, useCategory: true, useCountry: Boolean(country), useCampaign: true });
+    }
+
+    if (job.data.length < minimumInfluencers) {
+      await addPool({ useKeyword: false, useCategory: false, useCountry: Boolean(country), useCampaign: true });
+    }
+
+    if (!hardCountry && job.data.length < minimumInfluencers) {
+      await addPool({ useKeyword: false, useCategory: true, useCountry: false, useCampaign: false });
+    }
+
+    if (!hardCountry && job.data.length < minimumInfluencers) {
+      await addPool({ useKeyword: false, useCategory: false, useCountry: false, useCampaign: false });
+    }
+
+    if (!hardCountry && job.data.length < minimumInfluencers) {
+      await addPool({ useKeyword: false, useCategory: false, useCountry: false, useCampaign: false, useActiveSince: false });
     }
 
     if (save) {
@@ -2998,7 +3615,7 @@ async function recommendInfluencersForCampaign(req, res) {
       String(req.body.force ?? req.query.force ?? 'false').toLowerCase() === 'true';
 
     const campaignDetails = await buildRecommendationCampaignDetails(campaign);
-    const country = cleanStr(campaignDetails.targetCountry).toUpperCase();
+    const country = normalizeCountryCode(campaignDetails.targetCountry);
     const keyword = cleanStr(campaignDetails.rawCampaignTitle || campaignDetails.productName);
     const category = cleanStr(
       campaignDetails.rawCampaignSubcategory ||
@@ -3661,6 +4278,95 @@ function getFastMediaKitCreatorSnapshot(creator = {}, videoLimit = MEDIA_KIT_DEF
   };
 }
 
+
+function hasUsableMediaKitVideoData(mediaKit = {}) {
+  const metrics = mediaKit?.coreMetrics || {};
+  const recentVideos = Array.isArray(mediaKit?.recentVideos) ? mediaKit.recentVideos : [];
+  const topVideos = Array.isArray(mediaKit?.topPerformingVideos) ? mediaKit.topPerformingVideos : [];
+
+  return Boolean(
+    toNum(metrics.avgViews) > 0 ||
+      toNum(metrics.avgLikes) > 0 ||
+      toNum(metrics.avgComments) > 0 ||
+      toNum(metrics.engagementRate) > 0 ||
+      cleanStr(metrics.recentUploadDate) ||
+      recentVideos.length ||
+      topVideos.length
+  );
+}
+
+async function hydrateCreatorWithYouTubeVideosIfNeeded(creator = {}, channelId = '', videoLimit = MEDIA_KIT_DEFAULT_VIDEO_LIMIT, context = {}) {
+  const hasRecentVideos = Array.isArray(creator.recentVideos) && creator.recentVideos.length > 0;
+  const hasMetrics = toNum(creator.avgViews) > 0 || toNum(creator.avgLikes) > 0 || toNum(creator.engagementRate) > 0;
+
+  if (hasRecentVideos && hasMetrics) return creator;
+
+  const safeChannelId = cleanStr(channelId || creator.channelId);
+  if (!safeChannelId) return creator;
+
+  const channels = await fetchChannelsByIds([safeChannelId]);
+  const channel = channels[0];
+  if (!channel) return creator;
+
+  const uploadsPlaylistId = channel?.contentDetails?.relatedPlaylists?.uploads || null;
+  const videos = await fetchRecentVideos(uploadsPlaylistId, videoLimit);
+  if (!videos.length) return creator;
+
+  const rebuilt = buildCreatorDoc(
+    channel,
+    videos,
+    {
+      campaignId: creator.lastCampaignId || creator?.campaignContext?.campaignId || '',
+      campaignName: creator?.campaignContext?.campaignName || '',
+      campaignNiche: context.category || creator.category || creator.channelCategory || creator.foundViaQuery || '',
+      productName: context.keyword || creator.foundViaQuery || creator.category || '',
+      targetCountry: context.country || creator.country || creator.estimatedAudienceCountry || '',
+      minSubscribers: null,
+      maxSubscribers: null,
+      minAvgViews: null,
+      strictFilters: false,
+      strictCountry: false,
+      skipOpenAIAnalysis: true,
+      searchMode: 'channel',
+      source: 'youtube_api',
+      keywords: [context.keyword, context.category, creator.foundViaQuery].filter(Boolean),
+    },
+    {
+      foundViaQuery: creator.foundViaQuery || context.keyword || context.category || '',
+      sourceVideoTitle: creator.sourceVideoTitle || '',
+      sourceVideoUrl: creator.sourceVideoUrl || '',
+      requestedCategory: context.category || creator.category || creator.channelCategory || '',
+    },
+    Array.isArray(creator.allSearchKeywordsUsed)
+      ? creator.allSearchKeywordsUsed
+      : [context.keyword, context.category].filter(Boolean)
+  );
+
+  const hydrated = {
+    ...(creator || {}),
+    ...rebuilt,
+    searchMode: 'channel',
+    source: 'youtube_api',
+    profileSource: 'youtube_api',
+    scriptExecuted: false,
+    skipScript: true,
+    skipAppsScript: true,
+  };
+
+  const { _id, campaignContext, ...updatePayload } = hydrated;
+
+  await YouTubeData.updateOne(
+    { channelId: safeChannelId },
+    {
+      $set: updatePayload,
+      ...(campaignContext ? { $addToSet: { campaignContexts: campaignContext } } : {}),
+    },
+    { upsert: true }
+  ).catch(() => {});
+
+  return hydrated;
+}
+
 function saveInfoMediaKitInBackground(req, channelId, creator, mediaKit) {
   if (!InfoMediaKit || !channelId || !creator || !mediaKit) return;
 
@@ -3710,7 +4416,7 @@ async function getCreatorMediaKit(req, res) {
     // This keeps Media Kit clicks fast and avoids rebuilding the same report.
     if (InfoMediaKit) {
       const cachedMediaKit = await InfoMediaKit.findOne({ channelId }).lean();
-      if (cachedMediaKit?.mediaKitData) {
+      if (cachedMediaKit?.mediaKitData && hasUsableMediaKitVideoData(cachedMediaKit.mediaKitData)) {
         InfoMediaKit.updateOne(
           { channelId },
           {
@@ -3743,10 +4449,17 @@ async function getCreatorMediaKit(req, res) {
       country: cleanStr(req.query.country),
     };
 
-    // Build from the already saved creator snapshot only. No fresh YouTube/OpenAI
-    // enrichment is done on Media Kit click. This keeps first response fast while
-    // still using relevant recent-video, score, contact, tier, country, and topic data.
-    const fastCreator = getFastMediaKitCreatorSnapshot(creator, videoLimit);
+    // If channel search saved only channel-level data earlier, hydrate the
+    // missing latest posts and engagement metrics from the YouTube Data API.
+    // This is still not the script/OpenAI flow.
+    const hydratedCreator = await hydrateCreatorWithYouTubeVideosIfNeeded(
+      creator,
+      channelId,
+      videoLimit,
+      context
+    );
+
+    const fastCreator = getFastMediaKitCreatorSnapshot(hydratedCreator, videoLimit);
     const mediaKit = attachTopLevelEmailToMediaKit(
       buildBrandMediaKitData(fastCreator, context),
       {}
