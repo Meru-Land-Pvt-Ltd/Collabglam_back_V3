@@ -41,6 +41,9 @@ const {
   updateBrandSettingProfilePhoto,
   updateBrandSettingPassword,
   googleAuthBrand,
+    getBookmarkFolders,
+  createBookmarkFolder,
+
 } = require("../controllers/brandController");
 
 const { brandAuth } = require("../auth/brandAuth");
@@ -103,7 +106,13 @@ router.get("/setting/profile", brandAuth, getBrandSettingProfile);
 router.post("/setting/profile", brandAuth, updateBrandSettingProfile);
 
 router.patch("/setting/profile", brandAuth, updateBrandSettingProfile);
+// Folder selection modal APIs
+router.get("/bookmark/folders", brandAuth, getBookmarkFolders);
+router.post("/bookmark/folders", brandAuth, createBookmarkFolder);
 
+// // Keep your existing profile routes. These will now support folderId/folderTitle too.
+// router.post("/bookmark/profile", brandAuth, addbookmarkProfile);
+// router.get("/bookmark/profile", brandAuth, getbookmarkProfile);
 router.post(
   "/setting/profile/photo",
   brandAuth,

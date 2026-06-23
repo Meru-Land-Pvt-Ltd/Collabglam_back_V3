@@ -4692,3 +4692,411 @@ module.exports = {
   updateBrandSettingProfilePhoto,
   updateBrandSettingPassword,
 };
+/* -------------------------------------------------------------------------- */
+/*        ADD-ONLY: Bookmark folder modal support for Browse Influencers       */
+/* -------------------------------------------------------------------------- */
+/*
+  Keep all existing controller code above unchanged.
+  These functions are appended so existing APIs keep working, while bookmark
+  save now supports selecting an existing BrandFolder or creating a new folder.
+*/
+
+async function getBookmarkFolders(req, res) {
+  try {
+    const brandId = getFolderAuthedBrandId(req) || getBookmarkBrandIdFromReq(req);
+
+    if (!brandId) {
+      return res.status(401).json({
+        success: false,
+        error: "Brand authentication is required",
+      });
+    }
+
+    await getOrCreateBrandDefaultFolder({
+      brandId,
+      type: "bookmark",
+      title: "Bookmarked",
+      req,
+    });
+
+    const folders = await BrandFolderModel.find({
+      ...buildBrandScopedFolderFilter(brandId),
+      type: { $in: ["folder", "bookmark"] },
+    })
+      .sort({ isDefault: -1, updatedAt: -1, createdAt: -1 })
+      .lean();
+
+    return res.status(200).json({
+      success: true,
+      message: "Folders fetched successfully",
+      data: {
+        totalCount: folders.length,
+        folders: folders.map((folder) => serializeBrandFolderCard(folder)),
+      },
+    });
+  } catch (err) {
+    console.error("[getBookmarkFolders] Error:", err);
+    await saveErrorLog(
+      req,
+      err,
+      err?.statusCode || err?.status || 500,
+      "GET_BOOKMARK_FOLDERS_ERROR"
+    );
+
+    return res.status(500).json({
+      success: false,
+      error: err?.message || "Internal error",
+    });
+  }
+}
+
+async function createBookmarkFolder(req, res) {
+  try {
+    const brandId = getFolderAuthedBrandId(req) || getBookmarkBrandIdFromReq(req);
+
+    if (!brandId) {
+      return res.status(401).json({
+        success: false,
+        error: "Brand authentication is required",
+      });
+    }
+
+    const body = req.body || {};
+    const title = folderCleanStr(
+      body.title || body.name || body.folderTitle || body.folderName
+    );
+
+    if (!title) {
+      return res.status(400).json({
+        success: false,
+        error: "Folder name is required",
+      });
+    }
+
+    const slug = await buildUniqueBrandFolderSlug(brandId, title);
+
+    const incomingProfiles = Array.isArray(body.profiles)
+      ? body.profiles
+      : Array.isArray(body.influencers)
+        ? body.influencers
+        : body.profile
+          ? [body.profile]
+          : body.influencer
+            ? [body.influencer]
+            : [];
+
+    const initialItems = [];
+    const seenKeys = new Set();
+
+    incomingProfiles
+      .filter(Boolean)
+      .map((item) => normalizeBrandFolderItem(item, "saved"))
+      .filter((item) => item.profileKey)
+      .forEach((item) => {
+        if (seenKeys.has(item.profileKey)) return;
+        seenKeys.add(item.profileKey);
+        initialItems.push(item);
+      });
+
+    const folder = await BrandFolderModel.create({
+      brandId,
+      brandRef: folderToObjectId(brandId),
+      brandName: folderCleanStr(body.brandName || req.brand?.name),
+      title,
+      name: title,
+      slug,
+      description: folderCleanStr(body.description),
+      type: "folder",
+      creatorTier: folderCleanStr(body.creatorTier || body.tier),
+      linkedCampaign: null,
+      items: initialItems,
+      itemCount: initialItems.length,
+      isDefault: false,
+      createdByBrand: req.brand?._id || req.brand?.id || brandId,
+      archivedAt: null,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: initialItems.length
+        ? `Folder created and influencer saved to ${folder.title}.`
+        : "Folder created successfully",
+      data: {
+        folder: serializeBrandFolderDetail(folder.toObject()),
+        addedCount: initialItems.length,
+        skippedCount: 0,
+        savedKeys: folder.items.map((item) => item.profileKey).filter(Boolean),
+      },
+    });
+  } catch (err) {
+    console.error("[createBookmarkFolder] Error:", err);
+    await saveErrorLog(
+      req,
+      err,
+      err?.statusCode || err?.status || 500,
+      "CREATE_BOOKMARK_FOLDER_ERROR"
+    );
+
+    const duplicate = err?.code === 11000;
+
+    return res.status(duplicate ? 409 : 500).json({
+      success: false,
+      error: duplicate
+        ? "A folder with this name already exists"
+        : err?.message || "Internal error",
+    });
+  }
+}
+
+async function findBookmarkTargetFolderForSave(req, brandId) {
+  const body = req.body || {};
+
+  const folderId = folderCleanStr(
+    body.folderId || body.folder?._id || body.folder?.id
+  );
+
+  const folderTitle = folderCleanStr(
+    body.folderTitle ||
+      body.folderName ||
+      body.folder?.title ||
+      body.folder?.name
+  );
+
+  const shouldCreateFolder = Boolean(
+    body.createFolder || body.createNewFolder || body.shouldCreateFolder
+  );
+
+  if (folderId) {
+    const objectId = folderToObjectId(folderId);
+
+    if (!objectId) {
+      return { errorStatus: 400, error: "Invalid folderId" };
+    }
+
+    const folder = await BrandFolderModel.findOne({
+      ...buildBrandScopedFolderFilter(brandId),
+      _id: objectId,
+      type: { $in: ["folder", "bookmark"] },
+    });
+
+    if (!folder) {
+      return { errorStatus: 404, error: "Folder not found" };
+    }
+
+    return { folder };
+  }
+
+  if (folderTitle) {
+    const slug = folderSlugify(folderTitle);
+
+    let folder = await BrandFolderModel.findOne({
+      ...buildBrandScopedFolderFilter(brandId),
+      slug,
+      type: { $in: ["folder", "bookmark"] },
+    });
+
+    if (folder) return { folder };
+
+    if (!shouldCreateFolder) {
+      return {
+        errorStatus: 404,
+        error: "Folder not found. Send createFolder=true to create it.",
+      };
+    }
+
+    const uniqueSlug = await buildUniqueBrandFolderSlug(brandId, folderTitle);
+
+    folder = await BrandFolderModel.create({
+      brandId,
+      brandRef: folderToObjectId(brandId),
+      brandName: folderCleanStr(req.brand?.name || req.body?.brandName),
+      title: folderTitle,
+      name: folderTitle,
+      slug: uniqueSlug,
+      description: folderCleanStr(req.body?.description),
+      type: "folder",
+      creatorTier: "",
+      linkedCampaign: null,
+      items: [],
+      itemCount: 0,
+      isDefault: false,
+      createdByBrand: req.brand?._id || req.brand?.id || brandId,
+      archivedAt: null,
+    });
+
+    return { folder };
+  }
+
+  const folder = await getOrCreateBrandDefaultFolder({
+    brandId,
+    type: "bookmark",
+    title: "Bookmarked",
+    req,
+  });
+
+  return { folder };
+}
+
+async function addbookmarkProfile(req, res) {
+  try {
+    const brandId = getFolderAuthedBrandId(req) || getBookmarkBrandIdFromReq(req);
+
+    if (!brandId) {
+      return res.status(401).json({
+        success: false,
+        error: "Brand authentication is required",
+      });
+    }
+
+    const target = await findBookmarkTargetFolderForSave(req, brandId);
+
+    if (target.error) {
+      return res.status(target.errorStatus || 400).json({
+        success: false,
+        error: target.error,
+      });
+    }
+
+    const folder = target.folder;
+
+    const incomingProfiles = Array.isArray(req.body?.profiles)
+      ? req.body.profiles
+      : Array.isArray(req.body?.influencers)
+        ? req.body.influencers
+        : req.body?.profile
+          ? [req.body.profile]
+          : req.body?.influencer
+            ? [req.body.influencer]
+            : [req.body];
+
+    const status = folder.type === "bookmark" ? "bookmarked" : "saved";
+
+    const profiles = incomingProfiles
+      .filter(Boolean)
+      .map((item) => normalizeBrandFolderItem(item, status))
+      .filter((item) => item.profileKey);
+
+    if (!profiles.length) {
+      return res.status(400).json({
+        success: false,
+        error: "At least one influencer profile is required",
+      });
+    }
+
+    const result = upsertProfilesIntoBrandFolder(folder, profiles);
+    await folder.save();
+
+    const folderName = folder.title || folder.name || "folder";
+
+    return res.status(result.added ? 201 : 200).json({
+      success: true,
+      message: result.added
+        ? `Influencer saved to ${folderName}.`
+        : `Influencer already exists in ${folderName}.`,
+      data: {
+        folder: serializeBrandFolderDetail(folder.toObject()),
+        addedCount: result.added,
+        skippedCount: result.skipped,
+        savedKeys: folder.items.map((item) => item.profileKey).filter(Boolean),
+      },
+    });
+  } catch (err) {
+    console.error("[addbookmarkProfile] Error:", err);
+    await saveErrorLog(
+      req,
+      err,
+      err?.statusCode || err?.status || 500,
+      "ADD_BOOKMARK_PROFILE_ERROR"
+    );
+
+    return res.status(500).json({
+      success: false,
+      error: err?.message || "Internal error",
+    });
+  }
+}
+
+async function getbookmarkProfile(req, res) {
+  try {
+    const brandId = getFolderAuthedBrandId(req) || getBookmarkBrandIdFromReq(req);
+
+    if (!brandId) {
+      return res.status(401).json({
+        success: false,
+        error: "Brand authentication is required",
+      });
+    }
+
+    await getOrCreateBrandDefaultFolder({
+      brandId,
+      type: "bookmark",
+      title: "Bookmarked",
+      req,
+    });
+
+    const folderId = folderCleanStr(req.query?.folderId || req.query?.id);
+    const folderObjectId = folderToObjectId(folderId);
+
+    const folders = await BrandFolderModel.find({
+      ...buildBrandScopedFolderFilter(brandId),
+      type: { $in: ["folder", "bookmark"] },
+      ...(folderObjectId ? { _id: folderObjectId } : {}),
+    })
+      .sort({ isDefault: -1, updatedAt: -1, createdAt: -1 })
+      .lean();
+
+    const items = folders.flatMap((folder) => {
+      const folderItems = Array.isArray(folder.items) ? folder.items : [];
+
+      return folderItems.map((item) => ({
+        ...item,
+        folderId: String(folder._id),
+        folderTitle: folder.title || folder.name,
+        folderName: folder.name || folder.title,
+        folderType: folder.type,
+      }));
+    });
+
+    const savedKeys = Array.from(
+      new Set(items.map((item) => item.profileKey).filter(Boolean))
+    );
+
+    const defaultFolder =
+      folders.find((folder) => folder.type === "bookmark" && folder.isDefault) ||
+      folders[0] ||
+      null;
+
+    return res.status(200).json({
+      success: true,
+      message: "Saved influencer profiles fetched successfully",
+      data: {
+        folder: defaultFolder ? serializeBrandFolderCard(defaultFolder) : null,
+        folders: folders.map((folder) => serializeBrandFolderCard(folder)),
+        totalCount: items.length,
+        savedKeys,
+        items,
+      },
+    });
+  } catch (err) {
+    console.error("[getbookmarkProfile] Error:", err);
+    await saveErrorLog(
+      req,
+      err,
+      err?.statusCode || err?.status || 500,
+      "GET_BOOKMARK_PROFILE_ERROR"
+    );
+
+    return res.status(500).json({
+      success: false,
+      error: err?.message || "Internal error",
+    });
+  }
+}
+
+module.exports = {
+  ...module.exports,
+  getBookmarkFolders,
+  createBookmarkFolder,
+  addbookmarkProfile,
+  getbookmarkProfile,
+};
