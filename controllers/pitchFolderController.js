@@ -3525,6 +3525,14 @@ exports.generateShareLink = async (req, res) => {
       return res.status(404).json({ error: 'Pitch folder not found' });
     }
 
+    if (doc.share?.token && doc.share?.url) {
+      return res.json({
+        success: true,
+        message: 'Share link fetched successfully',
+        data: serializeFolderDetail(doc).share,
+      });
+    }
+
     const token = crypto.randomBytes(24).toString('hex');
     const url = `${getShareBaseUrl()}/${token}`;
 
@@ -3534,6 +3542,7 @@ exports.generateShareLink = async (req, res) => {
       generatedAt: new Date(),
       sharedByAdminId: actorId || null,
     };
+
     doc.updatedByAdmin = actorId || null;
 
     const hydrated = await saveAndHydrateFolder(doc);
@@ -3546,7 +3555,14 @@ exports.generateShareLink = async (req, res) => {
   } catch (err) {
     console.error('[generateShareLink] Error:', err);
 
-    await saveErrorLog(req, err, err?.response?.status || err?.statusCode || err?.status || 500, 'GENERATE_SHARE_LINK_ERROR'); return res.status(500).json({ error: err?.message || 'Internal error' });
+    await saveErrorLog(
+      req,
+      err,
+      err?.response?.status || err?.statusCode || err?.status || 500,
+      'GENERATE_SHARE_LINK_ERROR'
+    );
+
+    return res.status(500).json({ error: err?.message || 'Internal error' });
   }
 };
 

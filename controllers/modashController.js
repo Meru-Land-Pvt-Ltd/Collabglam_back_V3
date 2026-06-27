@@ -4820,37 +4820,132 @@ async function upsertCreator(req, res) {
 
 async function getCreatorByUserId(req, res) {
   try {
-    const { userId } = req.params;
+    const rawUserId = cleanStr(req.params?.userId || "");
+    const userId = decodeURIComponent(rawUserId).trim();
 
-    if (!userId || !String(userId).trim()) {
+    if (!userId) {
       return res.status(400).json({
+        success: false,
         message: "userId is required",
       });
     }
 
-    const creator = await Creator.findOne({
-      userId: String(userId).trim(),
+    const userIdNoAt = userId.replace(/^@+/, "").trim();
+
+    const requestedPlatform = normalizePlatform(
+      req.query?.platform ||
+        req.query?.provider ||
+        (userId.startsWith("UC") ? "youtube" : "")
+    );
+
+    const canShowSensitive = canShowSensitiveFromRequest(req, {
+      adminId: cleanStr(req.query?.adminId || req.query?.admin_id || ""),
     });
 
-    if (!creator) {
-      return res.status(404).json({
-        message: "Creator not found",
+    const creatorOr = [
+      { userId },
+      { userId: userIdNoAt },
+      { username: exactCI(userIdNoAt) },
+      { handle: exactCI(userIdNoAt) },
+      { handle: exactCI(`@${userIdNoAt}`) },
+      { url: containsCI(userId) },
+    ];
+
+    if (mongoose.Types.ObjectId.isValid(userId)) {
+      creatorOr.unshift({ _id: new mongoose.Types.ObjectId(userId) });
+    }
+
+    // 1) Old flow: local Creator collection
+    const creator = await Creator.findOne({ $or: creatorOr }).lean();
+
+    if (creator) {
+      return res.status(200).json({
+        success: true,
+        message: "Creator details fetched successfully",
+        source: "creator",
+        data: creator,
       });
     }
 
-    return res.status(200).json({
-      message: "Creator details fetched successfully",
-      data: creator,
+    const modashFilter = {
+      $or: creatorOr,
+    };
+
+    if (requestedPlatform) {
+      modashFilter.provider = requestedPlatform;
+    }
+
+    // 2) New/fallback flow: ModashProfile cache
+    const cachedModashCreator = await ModashProfile.findOne(modashFilter).lean();
+
+    if (cachedModashCreator) {
+      return res.status(200).json({
+        success: true,
+        message: "Creator details fetched successfully",
+        source: "modash_cache",
+        data: mapSavedDoc(cachedModashCreator, canShowSensitive),
+      });
+    }
+
+    // 3) Final fallback: for YouTube channel IDs, fetch report from Modash and save cache
+    if (requestedPlatform) {
+      try {
+        const reportJSON = await modashGET(
+          `/${requestedPlatform}/profile/${encodeURIComponent(userId)}/report`,
+          { calculationMethod: "median" }
+        );
+
+        const normalized = normalizeReportData(reportJSON);
+
+        const savedModashProfile = await upsertModashProfileFromReport2(
+          normalized,
+          requestedPlatform,
+          {
+            userIdFromRequest: userId,
+            handle: userIdNoAt,
+          }
+        );
+
+        const savedPlain =
+          savedModashProfile && typeof savedModashProfile.toObject === "function"
+            ? savedModashProfile.toObject()
+            : savedModashProfile;
+
+        return res.status(200).json({
+          success: true,
+          message: "Creator details fetched successfully",
+          source: "modash_live",
+          data: mapSavedDoc(savedPlain, canShowSensitive),
+        });
+      } catch (modashErr) {
+        console.error("[getCreatorByUserId] Modash live fallback failed:", {
+          userId,
+          platform: requestedPlatform,
+          status: modashErr?.status,
+          message: modashErr?.message,
+        });
+      }
+    }
+
+    return res.status(404).json({
+      success: false,
+      message: "Creator not found",
+      hint:
+        "Creator was not found in Creator or ModashProfile cache. Open/generate the creator report first, or pass ?platform=youtube for YouTube channel IDs.",
     });
   } catch (error) {
     console.error("getCreatorByUserId error:", error);
+
     await saveErrorLog(req, error, 500, "GET_CREATOR_BY_USER_ID_ERROR");
+
     return res.status(500).json({
+      success: false,
       message: "Internal server error",
       error: error.message,
     });
   }
 }
+
 function cleanParam(value, fallback = "") {
   try {
     if (value === undefined || value === null) return fallback;
